@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Node
+metadata:
+  name: big-16cpu
+  labels:
+    kubernetes.io/role: agent
+    node.kubernetes.io/instance-type: fake-16cpu
+    type: kwok
+  annotations:
+    kwok.x-k8s.io/node: fake
+spec: {}
+status:
+  allocatable: {cpu: "16", memory: "64Gi", pods: "110"}
+  capacity: {cpu: "16", memory: "64Gi", pods: "110"}
+  nodeInfo: {kubeletVersion: fake, kubeProxyVersion: fake, operatingSystem: linux, architecture: arm64}
+  phase: Running
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: small-8cpu-a
+  labels:
+    kubernetes.io/role: agent
+    node.kubernetes.io/instance-type: fake-8cpu
+    type: kwok
+  annotations:
+    kwok.x-k8s.io/node: fake
+spec: {}
+status:
+  allocatable: {cpu: "8", memory: "32Gi", pods: "110"}
+  capacity: {cpu: "8", memory: "32Gi", pods: "110"}
+  nodeInfo: {kubeletVersion: fake, kubeProxyVersion: fake, operatingSystem: linux, architecture: arm64}
+  phase: Running
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: small-8cpu-b
+  labels:
+    kubernetes.io/role: agent
+    node.kubernetes.io/instance-type: fake-8cpu
+    type: kwok
+  annotations:
+    kwok.x-k8s.io/node: fake
+spec: {}
+status:
+  allocatable: {cpu: "8", memory: "32Gi", pods: "110"}
+  capacity: {cpu: "8", memory: "32Gi", pods: "110"}
+  nodeInfo: {kubeletVersion: fake, kubeProxyVersion: fake, operatingSystem: linux, architecture: arm64}
+  phase: Running
