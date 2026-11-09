@@ -73,14 +73,30 @@ private[spark] class BasicExecutorFeatureStep(
     kubernetesConf.get(MEMORY_OVERHEAD_FACTOR)
   }
 
-  val execResources = ResourceProfile.getResourcesForClusterManager(
-    resourceProfile.id,
-    resourceProfile.executorResources,
-    minimumMemoryOverhead,
-    memoryOverheadFactor,
-    kubernetesConf.sparkConf,
-    isPythonApp,
-    Map.empty)
+  val execResources = {
+    val resolved = ResourceProfile.getResourcesForClusterManager(
+      resourceProfile.id,
+      resourceProfile.executorResources,
+      minimumMemoryOverhead,
+      memoryOverheadFactor,
+      kubernetesConf.sparkConf,
+      isPythonApp,
+      Map.empty)
+    // SPARK-61258 prototype: a ladder rung chosen by ExecutorPodsAllocator overrides the
+    // default profile's cores and heap while keeping heap per core constant.
+    kubernetesConf.get(KUBERNETES_EXECUTOR_SHAPE_CORES) match {
+      case Some(rungCores) if isDefaultProfile && resolved.cores.nonEmpty =>
+        val heapMiB = resolved.executorMemoryMiB * rungCores / resolved.cores.get
+        val overheadMiB = math.max((memoryOverheadFactor * heapMiB).toLong, minimumMemoryOverhead)
+        resolved.copy(
+          cores = Some(rungCores),
+          executorMemoryMiB = heapMiB,
+          memoryOverheadMiB = overheadMiB,
+          totalMemMiB =
+            heapMiB + overheadMiB + resolved.memoryOffHeapMiB + resolved.pysparkMemoryMiB)
+      case _ => resolved
+    }
+  }
   assert(execResources.cores.nonEmpty)
 
   private val executorMemoryString = s"${execResources.executorMemoryMiB}m"

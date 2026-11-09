@@ -656,6 +656,39 @@ private[spark] object Config extends Logging {
         + "time value.")
       .createWithDefaultString("1s")
 
+  val KUBERNETES_EXECUTOR_SHAPE_LADDER =
+    ConfigBuilder("spark.kubernetes.executor.shape.ladder")
+      .doc("Prototype for SPARK-61258. Comma-separated executor core counts, e.g. 16,8,4,2. " +
+        "When set, executors of the default resource profile are requested at the largest " +
+        "rung and the allocator moves one rung down whenever a pod stays Unschedulable for " +
+        "lack of cpu or memory longer than spark.kubernetes.executor.shape.downshiftTimeout. " +
+        "Heap per core is derived from spark.executor.memory / spark.executor.cores, and " +
+        "spark.executor.instances as well as the dynamic allocation target are interpreted in " +
+        "units of spark.executor.cores.")
+      .version("5.0.0")
+      .intConf
+      .toSequence
+      .checkValue(l => l.nonEmpty && l.forall(_ > 0), "Ladder rungs must be positive core counts.")
+      .createOptional
+
+  val KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT =
+    ConfigBuilder("spark.kubernetes.executor.shape.downshiftTimeout")
+      .doc("Prototype for SPARK-61258. How long a default-profile executor pod may stay " +
+        "Unschedulable for lack of cpu or memory before it is deleted and its slots are " +
+        "re-requested one rung down spark.kubernetes.executor.shape.ladder.")
+      .version("5.0.0")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .createWithDefaultString("60s")
+
+  // Set per pod by ExecutorPodsAllocator so that BasicExecutorFeatureStep sizes the container
+  // for one ladder rung. Not a user-facing config.
+  val KUBERNETES_EXECUTOR_SHAPE_CORES =
+    ConfigBuilder("spark.kubernetes.executor.shape.internal.cores")
+      .internal()
+      .version("5.0.0")
+      .intConf
+      .createOptional
+
   val KUBERNETES_ALLOCATION_EXECUTOR_TIMEOUT =
     ConfigBuilder("spark.kubernetes.allocation.executor.timeout")
       .doc("Time to wait before a newly created executor POD request, which does not reached " +

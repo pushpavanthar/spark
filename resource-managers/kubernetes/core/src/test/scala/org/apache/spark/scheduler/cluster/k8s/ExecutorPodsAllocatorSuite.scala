@@ -26,7 +26,7 @@ import scala.jdk.CollectionConverters._
 import io.fabric8.kubernetes.api.model._
 import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException}
 import io.fabric8.kubernetes.client.dsl.PodResource
-import org.mockito.{Mock, MockitoAnnotations}
+import org.mockito.{ArgumentCaptor, Mock, MockitoAnnotations}
 import org.mockito.ArgumentMatchers.{any, anyString, eq => meq}
 import org.mockito.Mockito.{clearInvocations, never, times, verify, when}
 import org.mockito.invocation.InvocationOnMock
@@ -522,6 +522,48 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
     verify(podsWithNamespace, never()).resource(podWithAttachedContainerForId(2))
     verify(podResource, times(1)).create()
+  }
+
+  test("SPARK-61258 prototype: shape ladder requests the largest rung and downshifts on " +
+      "capacity misses") {
+    val ladderConf = conf.clone()
+      .set(EXECUTOR_CORES, 2)
+      .set(KUBERNETES_EXECUTOR_SHAPE_LADDER.key, "8,4,2")
+      .set(KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT.key, "10s")
+    podsAllocatorUnderTest = new ExecutorPodsAllocator(ladderConf, secMgr, executorBuilder,
+      kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
+    podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
+    val captor = ArgumentCaptor.forClass(classOf[KubernetesExecutorConf])
+
+    // 4 reference executors of 2 cores = 8 cores -> one 8-core pod at the top rung.
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    verify(executorBuilder, times(1))
+      .buildFromFeatures(captor.capture(), meq(kubernetesClient), any(classOf[ResourceProfile]))
+    assert(captor.getValue.get(KUBERNETES_EXECUTOR_SHAPE_CORES) === Some(8))
+    assert(captor.getValue.labels(SPARK_EXECUTOR_SHAPE_CORES_LABEL) === "8")
+
+    // The pod cannot be placed for lack of cpu. Before the timeout nothing happens.
+    val unschedulable = new PodBuilder(unschedulableExecutor(1,
+        message = "0/2 nodes are available: 2 Insufficient cpu."))
+      .editMetadata().addToLabels(SPARK_EXECUTOR_SHAPE_CORES_LABEL, "8").endMetadata()
+      .build()
+    snapshotsStore.updatePod(unschedulable)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods, never()).delete()
+    verify(executorBuilder, times(1))
+      .buildFromFeatures(any(classOf[KubernetesExecutorConf]), meq(kubernetesClient),
+        any(classOf[ResourceProfile]))
+
+    // Past the timeout: the pod is deleted and the same 8 cores come back as two 4-core pods.
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1")
+    verify(labeledPods).delete()
+    verify(executorBuilder, times(3))
+      .buildFromFeatures(captor.capture(), meq(kubernetesClient), any(classOf[ResourceProfile]))
+    assert(captor.getAllValues.asScala.map(_.get(KUBERNETES_EXECUTOR_SHAPE_CORES)).toSeq ===
+      Seq(Some(8), Some(8), Some(4), Some(4)))
   }
 
   test("SPARK-34334: correctly identify timed out pending pod requests as excess") {

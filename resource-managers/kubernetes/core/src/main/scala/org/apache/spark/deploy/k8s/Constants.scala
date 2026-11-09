@@ -33,6 +33,7 @@ object Constants {
   val SPARK_APP_NAME_LABEL = "spark-app-name"
   val SPARK_EXECUTOR_ID_LABEL = "spark-exec-id"
   val SPARK_RESOURCE_PROFILE_ID_LABEL = "spark-exec-resourceprofile-id"
+  val SPARK_EXECUTOR_SHAPE_CORES_LABEL = "spark-exec-shape-cores"
   val SPARK_ROLE_LABEL = "spark-role"
   val SPARK_POD_DRIVER_ROLE = "driver"
   val SPARK_POD_EXECUTOR_ROLE = "executor"
