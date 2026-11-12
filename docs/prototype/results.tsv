@@ -1,0 +1,13 @@
+exp	fidelity_strict	fidelity_joins	flagged	replay_ms_median	status	description
+E0	0.4722	0.8148	0	0.0	baseline	naive: assume the recorded plan is unchanged by the config
+E2	0.7685	0.8241	32	4.5	keep	real planner + real AQE loop via finalPhysicalPlan, fake shuffle/broadcast exchanges return recorded stats, per-map sizes registered in MapOutputTracker, divisor fold for partition count
+E3	0.9352	0.9907	16	5.1	keep	capture also reads AQE stageCache so stages eliminated from the final plan (empty-relation propagation) are recorded
+E3-noaqe	0.0278	0.5278	0	8.8	discard	ablation: static replan with AQE disabled
+E3-norows	0.7685	0.8241	47	5.4	discard	ablation: drop recorded row counts (empty-relation propagation lost)
+E3-nofold	0.9074	0.9815	34	5.1	discard	ablation: no divisor fold for partition count
+E4	0.9352	0.9907	33	4.7	keep	flag folded partition counts (bytes off by up to 14% vs real); all 7 misses now flagged, unflagged 75/75
+H2	-	-	-	-	harness	harness v2: +2 byte-skewed queries, +3 skew variants (168 pairs, 30 with skew split)
+E4@H2	0.9345	0.9702	46	3.6	keep	same approach on harness v2; unflagged 122/122
+H3	-	-	-	-	harness	harness v3: +1 query on key-clustered input (189 pairs, 43 with skew split); capture skips unmaterialized cached stages
+E4@H3	0.9312	0.9630	53-66	3.8	keep	final approach, two runs 0.9259 and 0.9312 (1 flagged pair flips); unflagged 136/136 and 123/123
+E4@H3-nomap	0.8730	0.9630	52-66	3.7	discard	ablation: uniform per-map sizes; q9 19/21 -> 8/21, 10 UNFLAGGED wrong predictions

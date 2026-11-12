@@ -1,0 +1,53 @@
+package org.apache.spark.sql.replay
+
+import com.fasterxml.jackson.databind.JsonNode
+
+import org.apache.spark.scheduler.SparkListenerEvent
+
+/**
+ * The optimized logical plan of one SQL execution, reduced to what planning depends on, plus the
+ * row counts and broadcast statistics observed while it ran.
+ *
+ * Primitive collections are arrays, not Seq/Option/Map: jackson-module-scala erases their element
+ * type and hands back Integer where Long is declared.
+ *
+ * @param root skeleton tree, see [[SkeletonCodec]]
+ * @param opaqueNodes operators and expressions the codec could not represent
+ * @param rowKeys / rowValues observed output rows per subplan key
+ * @param broadcastKeys / broadcastDataSize / broadcastRows runtime statistics of each materialized
+ *        broadcast; rows is -1 when unknown
+ */
+case class SparkListenerSQLReplayPlan(
+    executionId: Long,
+    sparkVersion: String,
+    root: JsonNode,
+    opaqueNodes: Int,
+    rowKeys: Array[String],
+    rowValues: Array[Long],
+    broadcastKeys: Array[String],
+    broadcastDataSize: Array[Long],
+    broadcastRows: Array[Long]) extends SparkListenerEvent
+
+/**
+ * What AQE saw when one shuffle stage finished.
+ *
+ * @param key subplan key of the shuffle's input plus its partitioning, see [[Keys.shufKey]]
+ * @param numPartitions the partition count the plan asked for. A range partitioner may create
+ *        fewer; `bytesByPartitionId.length` is what it created
+ * @param bytesByPartitionId empty when the shuffle had no map output
+ * @param rowCount -1 when unknown
+ * @param mapSizePartitions / mapSizes for each listed reduce partition, the bytes written by every
+ *        map task. Only skew candidates are listed, see [[Keys.mapSizePartitions]]
+ * @param mapSizesTruncated true when more partitions qualified than were recorded
+ */
+case class SparkListenerSQLShuffleStageStats(
+    executionId: Long,
+    key: String,
+    numMappers: Int,
+    numPartitions: Int,
+    bytesByPartitionId: Array[Long],
+    rowCount: Long,
+    dataSize: Long,
+    mapSizePartitions: Array[Int],
+    mapSizes: Array[Array[Long]],
+    mapSizesTruncated: Boolean) extends SparkListenerEvent
