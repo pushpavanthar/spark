@@ -25,7 +25,10 @@ lazy val common = project.settings(libraryDependencies += sparkSql)
 // What ships in the application image, together with `common`.
 lazy val capture = project.dependsOn(common).settings(libraryDependencies += sparkSql)
 
-lazy val engine = project.dependsOn(common).settings(libraryDependencies += sparkSql)
+// Event log -> the scheduling timeline of a run.
+lazy val distiller = project.settings(libraryDependencies += sparkSql)
+
+lazy val engine = project.dependsOn(common, distiller).settings(libraryDependencies += sparkSql)
 
 lazy val fidelity = project.dependsOn(engine, capture).settings(
   libraryDependencies ++= Seq(sparkSql, "org.scalatest" %% "scalatest" % "3.2.19" % Test),

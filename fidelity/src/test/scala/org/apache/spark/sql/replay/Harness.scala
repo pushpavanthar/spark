@@ -185,8 +185,8 @@ object Harness {
 
   val tables: Seq[String] = Seq("sales", "sales_c", "item", "cust", "dates", "inv")
 
-  def session(conf: Map[String, String] = Map()): SparkSession = {
-    val b = SparkSession.builder().master("local[4]").appName("replay-fidelity")
+  def session(conf: Map[String, String] = Map(), cores: Int = 4): SparkSession = {
+    val b = SparkSession.builder().master(s"local[$cores]").appName("replay-fidelity")
       .config("spark.ui.enabled", "false").config("spark.sql.sources.useV1SourceList", "parquet")
     conf.foreach { case (k, v) => b.config(k, v) }
     b.withExtensions(Replay.install _).getOrCreate()
