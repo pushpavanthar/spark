@@ -37,20 +37,18 @@ is wrong, and an exact-match rate of at least 0.90 (measured: 0.93). Details of 
 Changing `Harness.queries`, `variants` or `base` changes the harness version and regenerates the
 ground truth. Bump `Harness.dataVersion` when `gen` changes.
 
-## Production replicas
+## Synthetic jobs
 
-    sbt "fidelity/testOnly *ProdReplicaSuite"
+    sbt "fidelity/testOnly *SyntheticJobSuite"
 
-Local-mode replicas of production jobs: the job's own SQL and SQL configs are read from local
-checkouts of the job repositories (`REPLICA_SRC`, default `~/inmobi/repo/marketing`) and run on
-synthetic data against a local Iceberg 1.10 catalog. No production data, DAG or cluster is touched;
-the tests are cancelled when the checkouts are absent. Each replica checks that a baseline replay
-gives the recorded plan with no flag and no opaque node, and that four config what-ifs give the
-plan of a real rerun or carry a flag.
+Three whole jobs written and fed by the suite itself, with no external code, data or cluster: a
+nested-event explode and aggregate into an hourly-partitioned Iceberg table, a wide rollup from
+Iceberg into Iceberg at 12000 shuffle partitions, and a union of three inputs joined to dimensions
+and a skewed fact. Each checks that a baseline replay gives the recorded plan with no flag and no
+opaque node, and that five config what-ifs give the plan of a real rerun or carry a flag.
 
-Not covered: Comet (no macOS native library) and the Scala job
-`silver_supplyrr_request_hourly_summary` (its input schema is not available locally). The engine
-needs the Iceberg runtime jar on its classpath to replay plans that write Iceberg tables.
+The engine needs the Iceberg runtime jar on its classpath to replay plans that write Iceberg
+tables. Not covered: Comet.
 
 ## Flags
 
