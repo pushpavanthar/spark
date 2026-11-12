@@ -19,6 +19,7 @@ import org.apache.spark.sql.execution.datasources.{LogicalRelation, WriteFiles}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.Utils
 
 /** Stands in for an expression the codec cannot represent (a UDF, a set of literal values). */
 case class OpaqueExpr(name: String, dataType: DataType, nullable: Boolean,
@@ -171,6 +172,10 @@ object SkeletonCodec {
       case None => tagged("none")(_ => ())
       case Some(x) => tagged("some")(_.set[JsonNode]("v", value(x)))
       case s: Seq[_] => tagged("seq")(_.set[JsonNode]("v", seq(s)))
+      // Operator options (to_json, from_json, csv): configuration, not data.
+      case m: Map[_, _] => tagged("map")(_.set[JsonNode]("v", seq(m.toSeq.flatMap(e => Seq(e._1, e._2)))))
+      // StaticInvoke names its target class: Iceberg's partition transforms in a write's distribution.
+      case c: Class[_] => tagged("class")(_.put("v", c.getName))
       case s: String => tagged("s")(_.put("v", s))
       case b: Boolean => tagged("b")(_.put("v", b))
       case i: Int => tagged("i")(_.put("v", i))
@@ -239,6 +244,14 @@ object SkeletonCodec {
       case "none" => None
       case "some" => Some(any(j.get("v")))
       case "seq" => items(j.get("v"))
+      case "map" => items(j.get("v")).grouped(2).map(e => e.head -> e(1)).toMap
+      // Loaded without initialization, so no code of the named class runs; it is never invoked.
+      case "class" =>
+        val name = j.get("v").asText
+        try Utils.classForName[AnyRef](name, initialize = false) catch {
+          case _: ClassNotFoundException =>
+            throw new ReplayUnsupportedException(s"class $name is not on the engine classpath")
+        }
       case "s" => j.get("v").asText
       case "b" => j.get("v").asBoolean
       case "i" => j.get("v").asInt

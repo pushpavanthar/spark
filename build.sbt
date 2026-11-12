@@ -31,7 +31,9 @@ lazy val distiller = project.settings(libraryDependencies += sparkSql)
 lazy val engine = project.dependsOn(common, distiller).settings(libraryDependencies += sparkSql)
 
 lazy val fidelity = project.dependsOn(engine, capture).settings(
-  libraryDependencies ++= Seq(sparkSql, "org.scalatest" %% "scalatest" % "3.2.19" % Test),
+  libraryDependencies ++= Seq(sparkSql, "org.scalatest" %% "scalatest" % "3.2.19" % Test,
+    // Same Iceberg as the spark-base image; only the production replicas use it.
+    "org.apache.iceberg" % "iceberg-spark-runtime-3.5_2.12" % "1.10.0" % Test),
   Test / fork := true,
   // One SparkContext per JVM.
   Test / parallelExecution := false,

@@ -59,7 +59,8 @@ object Keys {
   /** Skew candidates among reduce partitions, largest first, and whether the list was cut. */
   def mapSizePartitions(bytes: Array[Long]): (Array[Int], Boolean) = {
     if (bytes.isEmpty) return (Array.empty, false)
-    val candidates = bytes.indices.filter(i => bytes(i) > median(bytes) * MapSizeMinRatio)
+    val threshold = median(bytes) * MapSizeMinRatio
+    val candidates = bytes.indices.filter(i => bytes(i) > threshold)
       .sortBy(i => -bytes(i))
     (candidates.take(MapSizeMaxPartitions).toArray, candidates.size > MapSizeMaxPartitions)
   }
