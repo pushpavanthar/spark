@@ -27,7 +27,7 @@ import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants.DEFAULT_EXECUTOR_CONTAINER_NAME
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.MASTER_URL
-import org.apache.spark.internal.config.TASK_MAX_FAILURES
+import org.apache.spark.internal.config.{EXECUTOR_UNIT_WEIGHTING_ENABLED, TASK_MAX_FAILURES}
 import org.apache.spark.scheduler.{ExternalClusterManager, SchedulerBackend, TaskScheduler, TaskSchedulerImpl}
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
@@ -165,8 +165,11 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       snapshotsStore: ExecutorPodsSnapshotsStore,
       lifecycleManager: Option[ExecutorPodsLifecycleManager] = None) = {
     val allocator = sc.conf.get(KUBERNETES_ALLOCATION_PODS_ALLOCATOR)
-    // Fail fast on a shape ladder that cannot be honored, whatever the allocator.
-    ShapeLadder.fromConf(sc.conf)
+    // Fail fast on a shape ladder that cannot be honored, whatever the allocator. Executors of
+    // a ladder differ in size, so dynamic allocation has to weight them by their cores.
+    ShapeLadder.fromConf(sc.conf).foreach { _ =>
+      sc.conf.set(EXECUTOR_UNIT_WEIGHTING_ENABLED, true)
+    }
     if (allocator == "deployment" && Utils.isDynamicAllocationEnabled(sc.conf) &&
       sc.conf.get(KUBERNETES_EXECUTOR_POD_DELETION_COST).isEmpty) {
       throw new SparkException(

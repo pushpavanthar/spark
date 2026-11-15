@@ -18,6 +18,8 @@ package org.apache.spark.scheduler.cluster.k8s
 
 import org.apache.spark._
 import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.deploy.k8s.Config.KUBERNETES_EXECUTOR_SHAPE_LADDER
+import org.apache.spark.deploy.k8s.Constants.ENV_EXECUTOR_MEMORY
 import org.apache.spark.deploy.worker.WorkerWatcher
 import org.apache.spark.executor.CoarseGrainedExecutorBackend
 import org.apache.spark.internal.Logging
@@ -45,6 +47,27 @@ private[spark] object KubernetesExecutorBackend extends Logging {
       resourcesFileOpt: Option[String],
       resourceProfileId: Int,
       podName: String)
+
+  /**
+   * Under a shape ladder the driver's conf describes the reference shape, not this pod. Make
+   * the executor's conf describe the pod, so that readers of the executor cores and memory
+   * confs see the values the pod was built with.
+   */
+  private[k8s] def setShapeConfs(
+      conf: SparkConf,
+      cores: Int,
+      executorMemory: Option[String]): Unit = {
+    if (conf.contains(KUBERNETES_EXECUTOR_SHAPE_LADDER.key)) {
+      executorMemory.foreach { memory =>
+        // Off-heap memory was scaled with the heap when the pod was sized.
+        val offHeap = conf.get(MEMORY_OFFHEAP_SIZE)
+        conf.set(MEMORY_OFFHEAP_SIZE,
+          offHeap * Utils.memoryStringToMb(memory) / conf.get(EXECUTOR_MEMORY))
+        conf.set(EXECUTOR_MEMORY.key, memory)
+      }
+      conf.set(EXECUTOR_CORES, cores)
+    }
+  }
 
   def main(args: Array[String]): Unit = {
     val createFn: (RpcEnv, Arguments, SparkEnv, ResourceProfile, String) =>
@@ -126,6 +149,9 @@ private[spark] object KubernetesExecutorBackend extends Logging {
 
       driverConf.set(EXECUTOR_ID, execId)
       CoarseGrainedExecutorBackend.setResourceProfileConfs(driverConf, cfg.resourceProfile)
+      if (cfg.resourceProfile.id == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) {
+        setShapeConfs(driverConf, arguments.cores, sys.env.get(ENV_EXECUTOR_MEMORY))
+      }
       val env = SparkEnv.createExecutorEnv(driverConf, execId, arguments.bindAddress,
         arguments.hostname, arguments.cores, cfg.ioEncryptionKey, isLocal = false)
 

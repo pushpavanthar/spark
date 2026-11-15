@@ -28,7 +28,7 @@ import io.fabric8.kubernetes.client.KubernetesClient
 import io.fabric8.kubernetes.client.dsl.base.{PatchContext, PatchType}
 
 import org.apache.spark.SparkContext
-import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils}
+import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils, ShapeLadder}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.deploy.k8s.submit.KubernetesClientUtils
@@ -66,6 +66,8 @@ private[spark] class KubernetesClusterSchedulerBackend(
   private val initialExecutors = SchedulerBackendUtils.getInitialTargetExecutorNumber(conf)
 
   private val minRegisteredExecutors = initialExecutors * minRegisteredRatio
+
+  private val shapeLadder = ShapeLadder.fromConf(conf)
 
   private val appId: String =
     conf.getOption("spark.app.id").getOrElse(KubernetesConf.getKubernetesAppId())
@@ -215,7 +217,13 @@ private[spark] class KubernetesClusterSchedulerBackend(
   }
 
   override def sufficientResourcesRegistered(): Boolean = {
-    totalRegisteredExecutors.get() >= minRegisteredExecutors
+    shapeLadder match {
+      // Executors of a shape ladder differ in size and the initial target may be met by
+      // fewer, larger executors, so compare cores.
+      case Some(ladder) =>
+        totalCoreCount.get() >= minRegisteredExecutors * ladder.referenceCores
+      case None => totalRegisteredExecutors.get() >= minRegisteredExecutors
+    }
   }
 
   override def getExecutorIds(): Seq[String] = synchronized {

@@ -27,7 +27,7 @@ import org.apache.spark._
 import org.apache.spark.errors.SparkCoreErrors
 import org.apache.spark.internal.{Logging, LogKeys}
 import org.apache.spark.internal.config._
-import org.apache.spark.resource.ResourceProfile.UNKNOWN_RESOURCE_PROFILE_ID
+import org.apache.spark.resource.ResourceProfile.{DEFAULT_RESOURCE_PROFILE_ID, UNKNOWN_RESOURCE_PROFILE_ID}
 import org.apache.spark.scheduler._
 import org.apache.spark.storage.{RDDBlockId, ShuffleDataBlockId}
 import org.apache.spark.util.Clock
@@ -54,6 +54,10 @@ private[spark] class ExecutorMonitor(
     conf.get(SHUFFLE_SERVICE_FETCH_RDD_ENABLED)
   private val shuffleTrackingEnabled = !conf.get(SHUFFLE_SERVICE_ENABLED) &&
     conf.get(DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED)
+
+  // See EXECUTOR_UNIT_WEIGHTING_ENABLED. 0 when executors are not weighted.
+  private val unitCores =
+    if (conf.get(EXECUTOR_UNIT_WEIGHTING_ENABLED)) conf.get(EXECUTOR_CORES) else 0
 
   private val executors = new ConcurrentHashMap[String, Tracker]()
   private val execResourceProfileCount = new ConcurrentHashMap[Int, Int]()
@@ -134,7 +138,8 @@ private[spark] class ExecutorMonitor(
         .toSeq
       updateNextTimeout(newNextTimeout)
     }
-    timedOutExecs.sortBy(_._1)
+    // Smallest executors first, so that removal can stop closest to the target.
+    timedOutExecs.sortBy { case (id, _) => (executorUnits(id), id) }
   }
 
   /**
@@ -184,6 +189,23 @@ private[spark] class ExecutorMonitor(
   }
 
   def pendingRemovalCount: Int = executors.asScala.count { case (_, exec) => exec.pendingRemoval }
+
+  /**
+   * How many executors of its resource profile's reference shape this executor is worth.
+   * Always 1 unless executors are weighted by their cores.
+   */
+  def executorUnits(id: String): Int = {
+    val tracker = executors.get(id)
+    if (tracker == null) 1 else tracker.units
+  }
+
+  /** Units of the executors of a profile that are neither being removed nor decommissioned. */
+  def activeUnitsWithResourceProfile(id: Int): Int = {
+    executors.asScala.collect {
+      case (_, v) if v.resourceProfileId == id && !v.pendingRemoval && !v.decommissioning =>
+        v.units
+    }.sum
+  }
 
   def pendingRemovalCountPerResourceProfileId(id: Int): Int = {
     executors.asScala.count { case (k, v) => v.resourceProfileId == id && v.pendingRemoval }
@@ -341,6 +363,9 @@ private[spark] class ExecutorMonitor(
 
   override def onExecutorAdded(event: SparkListenerExecutorAdded): Unit = {
     val exec = ensureExecutorIsTracked(event.executorId, event.executorInfo.resourceProfileId)
+    if (unitCores > 0 && exec.resourceProfileId == DEFAULT_RESOURCE_PROFILE_ID) {
+      exec.units = math.max(1, event.executorInfo.totalCores / unitCores)
+    }
     exec.updateRunningTasks(0)
     logInfo(log"New executor ${MDC(LogKeys.EXECUTOR_ID, event.executorId)} has registered " +
       log"(new total is ${MDC(LogKeys.COUNT, executors.size())})")
@@ -535,6 +560,8 @@ private[spark] class ExecutorMonitor(
   }
 
   private[scheduler] class Tracker(var resourceProfileId: Int) {
+    @volatile var units: Int = 1
+
     @volatile var timeoutAt: Long = Long.MaxValue
 
     // Tracks whether this executor is thought to be timed out. It's used to detect when the list

@@ -1908,6 +1908,43 @@ class ExecutorAllocationManagerSuite extends SparkFunSuite {
     assert(manager.executorMonitor.executorCount === 0)
   }
 
+  test("SPARK-61258: idle removal counts executors of several sizes in units") {
+    def addExecutor(id: String, cores: Int): Unit = {
+      post(SparkListenerExecutorAdded(0L, id,
+        new ExecutorInfo("host1", cores, Map.empty, Map.empty, Map.empty, defaultProfile.id)))
+    }
+    def weightedConf: SparkConf = createConf(minExecutors = 1, maxExecutors = 10)
+      .set(config.EXECUTOR_CORES, 4)
+      .set(config.EXECUTOR_UNIT_WEIGHTING_ENABLED, true)
+
+    // A 16-core executor is worth 4 executors of the 4-core reference shape.
+    var manager = createManager(weightedConf)
+    addExecutor("big", 16)
+    addExecutor("small", 4)
+    assert(numExecutorsTargetForDefaultProfileId(manager) === 1)
+    // 5 units, removing 4 leaves the 1 the target and the minimum ask for.
+    assert(removeExecutors(manager, Seq(("big", defaultProfile.id))) === Seq("big"))
+    // 1 unit left, removing it would go below the minimum.
+    assert(removeExecutors(manager, Seq(("small", defaultProfile.id))) === Seq.empty)
+    manager.stop()
+
+    // With a target of 2 the large executor has to stay and the small one can go.
+    manager = createManager(weightedConf)
+    addExecutor("big", 16)
+    addExecutor("small", 4)
+    manager.numExecutorsTargetPerResourceProfileId(defaultProfile.id) = 2
+    assert(removeExecutors(manager,
+      Seq(("big", defaultProfile.id), ("small", defaultProfile.id))) === Seq("small"))
+    manager.stop()
+
+    // Without the weighting an executor is one executor, whatever its cores.
+    manager = createManager(weightedConf.set(config.EXECUTOR_UNIT_WEIGHTING_ENABLED, false))
+    addExecutor("big", 16)
+    addExecutor("small", 4)
+    assert(removeExecutors(manager, Seq(("big", defaultProfile.id))) === Seq("big"))
+    assert(removeExecutors(manager, Seq(("small", defaultProfile.id))) === Seq.empty)
+  }
+
   test("SPARK-23365 Don't update target num executors when killing idle executors") {
     val clock = new ManualClock()
     val manager = createManager(

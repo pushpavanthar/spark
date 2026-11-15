@@ -35,7 +35,7 @@ import org.apache.spark.{SparkConf, SparkContext, SparkEnv, SparkException, Spar
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.deploy.k8s.Fabric8Aliases._
-import org.apache.spark.internal.config.SCHEDULER_MAX_RETAINED_UNKNOWN_EXECUTORS
+import org.apache.spark.internal.config.{EXECUTOR_MEMORY_OVERHEAD, EXECUTOR_UNIT_WEIGHTING_ENABLED, SCHEDULER_MAX_RETAINED_UNKNOWN_EXECUTORS}
 import org.apache.spark.resource.{ResourceProfile, ResourceProfileManager}
 import org.apache.spark.rpc.{RpcAddress, RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.scheduler.{ExecutorDecommissionInfo, ExecutorKilled, ExecutorLossReason, LiveListenerBus, TaskSchedulerImpl}
@@ -169,11 +169,12 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
 
   private def registerExecutor(
       backend: KubernetesClusterSchedulerBackend,
-      executorId: String): RpcEndpointRef = {
+      executorId: String,
+      cores: Int = 1): RpcEndpointRef = {
     val executorEndpoint = mock(classOf[RpcEndpointRef])
     when(executorEndpoint.address).thenReturn(RpcAddress("localhost", 10000 + executorId.toInt))
     backend.createDriverEndpoint().receiveAndReply(mock(classOf[RpcCallContext])).apply(
-      RegisterExecutor(executorId, executorEndpoint, s"host-$executorId", 1,
+      RegisterExecutor(executorId, executorEndpoint, s"host-$executorId", cores,
         Map.empty, Map.empty, Map.empty, defaultProfile.id))
     assert(backend.isExecutorActive(executorId))
     executorEndpoint
@@ -259,6 +260,35 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
     backend.doRemoveExecutor("1", reason)
     verify(driverEndpointRef).send(RemoveExecutor("1", reason))
     verify(podAllocator).setRecoveryMode()
+  }
+
+  test("SPARK-61258: a shape ladder is accounted in cores") {
+    assert(!schedulerBackendUnderTest.sufficientResourcesRegistered())
+    registerExecutor(schedulerBackendUnderTest, "1", cores = 4)
+    // 1 of 3 expected executors is below the 0.8 ratio when executors are counted.
+    assert(!schedulerBackendUnderTest.sufficientResourcesRegistered())
+
+    sparkConf.set(KUBERNETES_EXECUTOR_SHAPE_LADDER.key, "4,2,1")
+      .set(EXECUTOR_MEMORY_OVERHEAD.key, "400m")
+      .set(EXECUTOR_UNIT_WEIGHTING_ENABLED, true)
+    try {
+      val backend = createSchedulerBackend()
+      assert(!backend.sufficientResourcesRegistered())
+      // One 4-core executor covers the 3 expected 1-core executors.
+      registerExecutor(backend, "1", cores = 4)
+      assert(backend.sufficientResourcesRegistered())
+
+      // Killing it with a target adjustment takes 4 executors off the requested total.
+      backend.requestTotalExecutors(Map(defaultProfile.id -> 5), Map.empty, Map.empty)
+      verify(podAllocator).setTotalExpectedExecutors(Map(defaultProfile -> 5))
+      backend.killExecutors(Seq("1"), adjustTargetNumExecutors = true, countFailures = false,
+        force = true)
+      verify(podAllocator).setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    } finally {
+      sparkConf.remove(KUBERNETES_EXECUTOR_SHAPE_LADDER.key)
+        .remove(EXECUTOR_MEMORY_OVERHEAD.key)
+        .remove(EXECUTOR_UNIT_WEIGHTING_ENABLED.key)
+    }
   }
 
   test("Kill executors") {

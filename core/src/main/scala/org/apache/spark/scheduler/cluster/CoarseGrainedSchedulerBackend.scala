@@ -1111,13 +1111,21 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
         withLock {
           val rpId = executorDataMap(exec).resourceProfileId
           val rp = scheduler.sc.resourceProfileManager.resourceProfileFromId(rpId)
+          // See EXECUTOR_UNIT_WEIGHTING_ENABLED: a large executor is worth several requested ones.
+          val units = if (conf.get(EXECUTOR_UNIT_WEIGHTING_ENABLED) &&
+              rpId == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) {
+            math.max(1, executorDataMap(exec).totalCores / conf.get(EXECUTOR_CORES))
+          } else {
+            1
+          }
           if (requestedTotalExecutorsPerResourceProfile.isEmpty) {
             // Assume that we are killing an executor that was started by default and
             // not through the request api
             requestedTotalExecutorsPerResourceProfile(rp) = 0
           } else {
             val requestedTotalForRp = requestedTotalExecutorsPerResourceProfile(rp)
-            requestedTotalExecutorsPerResourceProfile(rp) = math.max(requestedTotalForRp - 1, 0)
+            requestedTotalExecutorsPerResourceProfile(rp) =
+              math.max(requestedTotalForRp - units, 0)
           }
         }
       }

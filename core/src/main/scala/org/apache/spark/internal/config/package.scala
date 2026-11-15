@@ -772,6 +772,17 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
+  private[spark] val EXECUTOR_UNIT_WEIGHTING_ENABLED =
+    ConfigBuilder("spark.dynamicAllocation.executorUnitWeighting.enabled")
+      .internal()
+      .doc("When true, an executor of the default resource profile counts as " +
+        "(its registered cores / spark.executor.cores) executors when dynamic allocation " +
+        "removes idle executors and when a kill adjusts the requested total. Set by cluster " +
+        "managers that start executors of several sizes for one resource profile.")
+      .version("5.0.0")
+      .booleanConf
+      .createWithDefault(false)
+
   private[spark] val DYN_ALLOCATION_TESTING =
     ConfigBuilder("spark.dynamicAllocation.testing")
       .version("1.2.0")

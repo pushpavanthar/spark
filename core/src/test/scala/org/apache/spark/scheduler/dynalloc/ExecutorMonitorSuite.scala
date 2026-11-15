@@ -78,6 +78,38 @@ class ExecutorMonitorSuite extends SparkFunSuite {
     monitor = new ExecutorMonitor(conf, client, null, clock, allocationManagerSource())
   }
 
+  test("SPARK-61258: executors are weighted by their cores when unit weighting is on") {
+    def info(cores: Int): ExecutorInfo =
+      new ExecutorInfo("host1", cores, Map.empty, Map.empty, Map.empty, DEFAULT_RESOURCE_PROFILE_ID)
+    def add(m: ExecutorMonitor, id: String, cores: Int): Unit = {
+      knownExecs += id
+      m.onExecutorAdded(SparkListenerExecutorAdded(clock.getTimeMillis(), id, info(cores)))
+    }
+
+    val weighted = new ExecutorMonitor(
+      conf.clone().set(EXECUTOR_CORES, 4).set(EXECUTOR_UNIT_WEIGHTING_ENABLED, true),
+      client, null, clock, allocationManagerSource())
+    add(weighted, "1", 16)
+    add(weighted, "2", 4)
+    add(weighted, "3", 2)
+    add(monitor, "1", 16)
+    add(monitor, "2", 4)
+    assert(weighted.executorUnits("1") === 4)
+    assert(weighted.executorUnits("2") === 1)
+    assert(weighted.executorUnits("3") === 1)
+    assert(weighted.executorUnits("unknown") === 1)
+    assert(weighted.activeUnitsWithResourceProfile(DEFAULT_RESOURCE_PROFILE_ID) === 6)
+    assert(monitor.executorUnits("1") === 1)
+    assert(monitor.activeUnitsWithResourceProfile(DEFAULT_RESOURCE_PROFILE_ID) === 2)
+
+    clock.advance(61000)
+    // Smallest first, then by id.
+    assert(weighted.timedOutExecutors().map(_._1) === Seq("2", "3", "1"))
+    assert(monitor.timedOutExecutors().map(_._1) === Seq("1", "2"))
+    weighted.executorsKilled(Seq("1"))
+    assert(weighted.activeUnitsWithResourceProfile(DEFAULT_RESOURCE_PROFILE_ID) === 2)
+  }
+
   test("basic executor timeout") {
     knownExecs += "1"
     monitor.onExecutorAdded(SparkListenerExecutorAdded(clock.getTimeMillis(), "1", execInfo))

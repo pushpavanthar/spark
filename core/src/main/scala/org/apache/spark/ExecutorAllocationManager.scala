@@ -685,22 +685,22 @@ private[spark] class ExecutorAllocationManager(
           log"because the ResourceProfile was UNKNOWN!")
       } else {
         // get the running total as we remove or initialize it to the count - pendingRemoval
+        // The total and the removal are counted in executor units, which is the number of
+        // executors unless executors are weighted by their cores.
         val newExecutorTotal = numExecutorsTotalPerRpId.getOrElseUpdate(rpId,
-          (executorMonitor.executorCountWithResourceProfile(rpId) -
-            executorMonitor.pendingRemovalCountPerResourceProfileId(rpId) -
-            executorMonitor.decommissioningPerResourceProfileId(rpId)
-          ))
-        if (newExecutorTotal - 1 < minNumExecutors) {
+          executorMonitor.activeUnitsWithResourceProfile(rpId))
+        val units = executorMonitor.executorUnits(executorIdToBeRemoved)
+        if (newExecutorTotal - units < minNumExecutors) {
           logDebug(s"Not removing idle executor $executorIdToBeRemoved because there " +
             s"are only $newExecutorTotal executor(s) left (minimum number of executor limit " +
             s"$minNumExecutors)")
-        } else if (newExecutorTotal - 1 < numExecutorsTargetPerResourceProfileId(rpId)) {
+        } else if (newExecutorTotal - units < numExecutorsTargetPerResourceProfileId(rpId)) {
           logDebug(s"Not removing idle executor $executorIdToBeRemoved because there " +
             s"are only $newExecutorTotal executor(s) left (number of executor " +
             s"target ${numExecutorsTargetPerResourceProfileId(rpId)})")
         } else {
           executorIdsToBeRemoved += executorIdToBeRemoved
-          numExecutorsTotalPerRpId(rpId) -= 1
+          numExecutorsTotalPerRpId(rpId) -= units
         }
       }
     }
