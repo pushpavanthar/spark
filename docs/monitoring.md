@@ -1442,6 +1442,13 @@ This is the component with the largest amount of instrumented metrics
   - executors.numberExecutorsExitedUnexpectedly.count
   - executors.numberExecutorsKilledByDriver.count
 
+- namespace=KubernetesExecutorShapeLadder
+  - **note:** these metrics are only emitted on Kubernetes when
+    `spark.kubernetes.executor.shape.ladder` is set
+  - currentRung (the largest executor size, in cores, that new pods may take)
+  - downshifts.count
+  - upshiftProbes.count
+
 - namespace=plugin.\<Plugin Class Name>
   - Optional namespace(s). Metrics in this namespace are defined by user-supplied code, and
   configured using the Spark plugin API. See "Advanced Instrumentation" below for how to load

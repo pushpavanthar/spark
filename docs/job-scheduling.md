@@ -137,6 +137,13 @@ it has been idle for more than `spark.dynamicAllocation.executorIdleTimeout` sec
 under most circumstances, this condition is mutually exclusive with the request condition, in that
 an executor should not be idle if there are still pending tasks to be scheduled.
 
+On Kubernetes, executors of one application can have different sizes when
+`spark.kubernetes.executor.shape.ladder` is set. The executor counts of dynamic allocation
+(`spark.dynamicAllocation.minExecutors`, `maxExecutors`, `initialExecutors` and the target) then
+count executors of `spark.executor.cores` cores, and an executor with a multiple of those cores counts
+as that many executors when idle executors are removed. See
+[Executor Shape Ladder](running-on-kubernetes.html#executor-shape-ladder).
+
 ### Graceful Decommission of Executors
 
 Before dynamic allocation, if a Spark executor exits when the associated application has also exited 
