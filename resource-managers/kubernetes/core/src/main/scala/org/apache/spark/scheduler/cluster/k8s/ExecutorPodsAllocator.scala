@@ -28,9 +28,9 @@ import io.fabric8.kubernetes.api.model.{HasMetadata, PersistentVolumeClaim, Pod,
 import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException}
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkException}
+import org.apache.spark.deploy.k8s.{KubernetesConf, ShapeLadder}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
-import org.apache.spark.deploy.k8s.KubernetesConf
 import org.apache.spark.deploy.k8s.KubernetesUtils.addOwnerReference
 import org.apache.spark.internal.{Logging, LogKeys}
 import org.apache.spark.internal.config._
@@ -135,6 +135,27 @@ class ExecutorPodsAllocator(
 
   // Executors whose pod was unschedulable in the last snapshot; used to log each reason once.
   protected var unschedulableExecutorIds = Set.empty[Long]
+
+  // The executor sizes the default resource profile may take, if configured (SPARK-61258).
+  // With a ladder the default profile is reconciled in cores: one expected executor is worth
+  // shapeLadder.referenceCores cores, and each pod carries its size in a label.
+  protected val shapeLadder: Option[ShapeLadder] = ShapeLadder.fromConf(conf)
+
+  private val shapeDownshiftTimeout = conf.get(KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT)
+
+  private val shapeCapacityMissPattern =
+    conf.get(KUBERNETES_EXECUTOR_SHAPE_CAPACITY_MISS_PATTERN).r
+
+  // The largest size new pods may take. It moves down when Kubernetes cannot fit a size.
+  @volatile protected var shapeCeilingCores: Int =
+    conf.get(KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES)
+      .orElse(shapeLadder.map(_.rungs.head)).getOrElse(0)
+
+  // Executor ID -> time its pod was first seen unschedulable for lack of cpu or memory.
+  private val capacityMissSince = mutable.HashMap.empty[Long, Long]
+
+  // Executor ID -> size in cores, for pods requested but not yet seen in a snapshot.
+  private val newlyCreatedShapeCores = mutable.HashMap.empty[Long, Int]
 
   def start(applicationId: String, schedulerBackend: KubernetesClusterSchedulerBackend): Unit = {
     appId = applicationId
@@ -279,6 +300,29 @@ class ExecutorPodsAllocator(
       _deletedExecutorIds = _deletedExecutorIds.intersect(existingExecs)
     }
 
+    shapeLadder.foreach { ladder =>
+      newlyCreatedShapeCores.filterInPlace { case (id, _) =>
+        newlyCreatedExecutors.contains(id) || schedulerKnownNewlyCreatedExecs.contains(id)
+      }
+      val candidates = lastSnapshot.executorPods.filter { case (id, _) =>
+        !_deletedExecutorIds.contains(id) && !schedulerKnownExecs.contains(id)
+      }
+      val tooLarge = podsAboveShapeCeiling(ladder, candidates, currentTime)
+      if (tooLarge.nonEmpty) {
+        _deletedExecutorIds = _deletedExecutorIds ++ tooLarge
+        Utils.tryLogNonFatalError {
+          kubernetesClient
+            .pods()
+            .inNamespace(namespace)
+            .withField("status.phase", "Pending")
+            .withLabel(SPARK_APP_ID_LABEL, applicationId)
+            .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+            .withLabelIn(SPARK_EXECUTOR_ID_LABEL, tooLarge.toSeq.sorted.map(_.toString): _*)
+            .delete()
+        }
+      }
+    }
+
     val notDeletedPods = lastSnapshot.executorPods
       .filter { case (k, _) => !_deletedExecutorIds.contains(k) }
     val unschedulable = notDeletedPods.collect { case (id, p: PodUnschedulable) => id -> p }
@@ -364,16 +408,46 @@ class ExecutorPodsAllocator(
         newlyCreatedExecutorsForRpId.size + schedulerKnownNewlyCreatedExecsForRpId.size
       val podCountForRpId = currentRunningCount + notRunningPodCountForRpId
 
-      if (podCountForRpId > targetNum) {
-        val excess = podCountForRpId - targetNum
-        val newlyCreatedToDelete = newlyCreatedExecutorsForRpId
+      // With a shape ladder the known pods and the target are compared in cores.
+      val ladderForRpId =
+        shapeLadder.filter(_ => rpId == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+      val (knownForRpId, targetForRpId) = ladderForRpId match {
+        case Some(ladder) =>
+          val podCores = podsForRpId.collect {
+            case (_, s @ (_: PodRunning | _: PendingPodState)) => shapeCores(ladder, s.pod)
+          }.sum
+          val newCores =
+            (newlyCreatedExecutorsForRpId.keys ++ schedulerKnownNewlyCreatedExecsForRpId.keys)
+              .map(newlyCreatedShapeCores.getOrElse(_, ladder.referenceCores)).sum
+          (podCores + newCores, targetNum * ladder.referenceCores)
+        case None => (podCountForRpId, targetNum)
+      }
+
+      if (knownForRpId > targetForRpId) {
+        val excess = knownForRpId - targetForRpId
+        val idleNewlyCreated = newlyCreatedExecutorsForRpId
           .filter { case (_, (_, createTime)) =>
             currentTime - createTime > executorIdleTimeout
-          }.keys.take(excess).toList
-        val pendingToDelete = currentPendingExecutorsForRpId
+          }.keys.toList
+        val idlePending = currentPendingExecutorsForRpId
           .filter(x => isExecutorIdleTimedOut(x._2, currentTime))
-          .take(excess - newlyCreatedToDelete.size)
-          .map { case (id, _) => id }
+        val (newlyCreatedToDelete, pendingToDelete) = ladderForRpId match {
+          case Some(ladder) =>
+            // Delete a pod only if its whole size fits in the excess.
+            var left = excess
+            def fits(cores: Int): Boolean = if (cores <= left) { left -= cores; true } else false
+            val newly = idleNewlyCreated.filter { id =>
+              fits(newlyCreatedShapeCores.getOrElse(id, ladder.referenceCores))
+            }
+            val pending = idlePending.toList.collect {
+              case (id, state) if fits(shapeCores(ladder, state.pod)) => id
+            }
+            (newly, pending)
+          case None =>
+            val newly = idleNewlyCreated.take(excess)
+            val pending = idlePending.take(excess - newly.size).map { case (id, _) => id }.toList
+            (newly, pending)
+        }
         val toDelete = newlyCreatedToDelete ++ pendingToDelete
 
         if (toDelete.nonEmpty) {
@@ -413,8 +487,8 @@ class ExecutorPodsAllocator(
           }
         }
       }
-      if (newlyCreatedExecutorsForRpId.isEmpty && podCountForRpId < targetNum) {
-        Some(rpId, podCountForRpId, targetNum, notRunningPodCountForRpId)
+      if (newlyCreatedExecutorsForRpId.isEmpty && knownForRpId < targetForRpId) {
+        Some(rpId, knownForRpId, targetForRpId, notRunningPodCountForRpId)
       } else {
         // for this resource profile we do not request more PODs
         None
@@ -431,7 +505,20 @@ class ExecutorPodsAllocator(
         .foreach { case ((rpId, podCountForRpId, targetNum, pendingPodCountForRpId),
             sharedSlotFromPendingPods) =>
         val remainingSlotsForRpId = maxPendingPodsPerRpid - pendingPodCountForRpId
-        val numMissingPodsForRpId = targetNum - podCountForRpId
+        // With a shape ladder targetNum and podCountForRpId are in cores, and the missing cores
+        // are covered by pods of the largest sizes that fit under the current ceiling.
+        val shapesToAllocate =
+          shapeLadder.filter(_ => rpId == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID).map { l =>
+            val ceiling = if (conf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED)
+                .getOrElse(false)) {
+              l.smallest
+            } else {
+              shapeCeilingCores
+            }
+            l.greedyFill(ceiling, targetNum - podCountForRpId)
+          }
+        val numMissingPodsForRpId =
+          shapesToAllocate.map(_.size).getOrElse(targetNum - podCountForRpId)
         val numExecutorsToAllocate = Seq(numMissingPodsForRpId, podAllocationSize,
           sharedSlotFromPendingPods, remainingSlotsForRpId).min
 
@@ -440,7 +527,8 @@ class ExecutorPodsAllocator(
           log"target: ${MDC(LogKeys.NUM_POD_TARGET, targetNum)}, " +
           log"known: ${MDC(LogKeys.NUM_POD, podCountForRpId)}, sharedSlotFromPendingPods: " +
           log"${MDC(LogKeys.NUM_POD_SHARED_SLOT, sharedSlotFromPendingPods)}.")
-        requestNewExecutors(numExecutorsToAllocate, applicationId, rpId, k8sKnownPVCNames)
+        requestNewExecutors(numExecutorsToAllocate, applicationId, rpId, k8sKnownPVCNames,
+          shapesToAllocate.getOrElse(Nil))
       }
     }
     deletedExecutorIds = _deletedExecutorIds
@@ -449,6 +537,57 @@ class ExecutorPodsAllocator(
     // update method when not needed. PODs known by the scheduler backend are not counted here as
     // they considered running PODs and they should not block upscaling.
     numOutstandingPods.set(totalPendingCount + newlyCreatedExecutors.size)
+  }
+
+  // Size in cores of an executor pod of the default profile under a shape ladder.
+  private def shapeCores(ladder: ShapeLadder, pod: Pod): Int = {
+    Option(pod.getMetadata.getLabels.get(SPARK_EXECUTOR_SHAPE_CORES_LABEL))
+      .map(_.toInt).getOrElse(ladder.referenceCores)
+  }
+
+  /**
+   * Lowers the shape ceiling when a pod has been unschedulable for lack of cpu or memory for
+   * longer than the downshift timeout, and returns the pending pods that are larger than the
+   * ceiling. The caller deletes them and the freed cores are requested again at smaller sizes.
+   * A pod of the smallest size stays pending, as without a ladder, and a pod that is
+   * unschedulable for any other reason (taint, affinity, volume) never lowers the ceiling.
+   */
+  private def podsAboveShapeCeiling(
+      ladder: ShapeLadder,
+      pods: Map[Long, ExecutorPodState],
+      currentTime: Long): Set[Long] = {
+    val pendingCores = pods.collect {
+      case (id, state: PendingPodState)
+          if state.pod.getMetadata.getLabels.containsKey(SPARK_EXECUTOR_SHAPE_CORES_LABEL) =>
+        id -> shapeCores(ladder, state.pod)
+    }
+    val misses = pods.collect {
+      case (id, PodUnschedulable(_, message))
+          if pendingCores.get(id).exists(_ > ladder.smallest) &&
+            shapeCapacityMissPattern.findFirstIn(message).nonEmpty => id
+    }.toSet
+    capacityMissSince.filterInPlace { case (id, _) => misses.contains(id) }
+    misses.foreach(capacityMissSince.getOrElseUpdate(_, currentTime))
+    val expired = capacityMissSince.collect {
+      case (id, since) if currentTime - since >= shapeDownshiftTimeout => id
+    }
+    if (expired.nonEmpty) {
+      val newCeiling = ladder.rungBelow(expired.map(pendingCores).min)
+      if (newCeiling < shapeCeilingCores) {
+        logInfo(log"Kubernetes could not fit executor pods of " +
+          log"${MDC(LogKeys.NUM_CORES, expired.map(pendingCores).min)} cores within " +
+          log"${MDC(LogKeys.TIMEOUT, shapeDownshiftTimeout)} ms; moving the shape ladder down " +
+          log"to ${MDC(LogKeys.COUNT, newCeiling)} cores per executor.")
+        shapeCeilingCores = newCeiling
+      }
+    }
+    val tooLarge = if (expired.nonEmpty) {
+      pendingCores.collect { case (id, cores) if cores > shapeCeilingCores => id }.toSet
+    } else {
+      Set.empty[Long]
+    }
+    capacityMissSince --= tooLarge
+    tooLarge
   }
 
   protected def getReusablePVCs(applicationId: String, pvcsInUse: Set[String]) = {
@@ -529,10 +668,11 @@ class ExecutorPodsAllocator(
       numExecutorsToAllocate: Int,
       applicationId: String,
       resourceProfileId: Int,
-      pvcsInUse: Set[String]): Unit = {
+      pvcsInUse: Set[String],
+      shapes: Seq[Int] = Nil): Unit = {
     // Check reusable PVCs for this executor allocation batch
     val reusablePVCs = getReusablePVCs(applicationId, pvcsInUse)
-    for ( _ <- 0 until numExecutorsToAllocate) {
+    for (i <- 0 until numExecutorsToAllocate) {
       if (reusablePVCs.isEmpty && podAllocOnPVC && maxPVCs <= PVC_COUNTER.get()) {
         logInfo(
           log"Wait to reuse one of the existing ${MDC(LogKeys.COUNT, PVC_COUNTER.get())} PVCs.")
@@ -542,8 +682,17 @@ class ExecutorPodsAllocator(
       if (newExecutorId >= podAllocationMaximum) {
         throw new SparkException(s"Exceed the pod creation limit: $podAllocationMaximum")
       }
+      // Under a shape ladder, the i-th pod of the batch gets the i-th size. The size reaches
+      // the pod builder through the conf and is recorded on the pod as a label.
+      val shape = shapes.lift(i)
+      val podConf = shape.map { cores =>
+        conf.clone()
+          .set(KUBERNETES_EXECUTOR_SHAPE_CORES, cores)
+          .set(s"$KUBERNETES_EXECUTOR_LABEL_PREFIX$SPARK_EXECUTOR_SHAPE_CORES_LABEL",
+            cores.toString)
+      }.getOrElse(conf)
       val executorConf = KubernetesConf.createExecutorConf(
-        conf,
+        podConf,
         newExecutorId.toString,
         applicationId,
         driverPod,
@@ -595,6 +744,7 @@ class ExecutorPodsAllocator(
               PVC_COUNTER.incrementAndGet()
             }
           newlyCreatedExecutors(newExecutorId) = (resourceProfileId, clock.getTimeMillis())
+          shape.foreach(newlyCreatedShapeCores(newExecutorId) = _)
           logDebug(s"Requested executor with id $newExecutorId from Kubernetes.")
         } catch {
           case NonFatal(e) =>

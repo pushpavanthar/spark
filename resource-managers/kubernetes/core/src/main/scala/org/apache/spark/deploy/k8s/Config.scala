@@ -637,6 +637,57 @@ private[spark] object Config extends Logging {
       .booleanConf
       .createOptional
 
+  val KUBERNETES_EXECUTOR_SHAPE_LADDER =
+    ConfigBuilder("spark.kubernetes.executor.shape.ladder")
+      .doc("Comma-separated list of executor sizes, in cores, that executors of the default " +
+        "resource profile may take, e.g. `16,8,4`. Every size must be a multiple of " +
+        "`spark.executor.cores`, which is the reference shape: memory per core is " +
+        "`spark.executor.memory` / `spark.executor.cores` at every size, and " +
+        "`spark.executor.instances` and the dynamic allocation limits are counted in executors " +
+        "of the reference shape. Spark requests the largest size first and moves to smaller " +
+        "sizes when Kubernetes reports that a pod cannot be scheduled for lack of cpu or " +
+        "memory. Requires the `direct` pods allocator.")
+      .version("5.0.0")
+      .intConf
+      .toSequence
+      .checkValue(l => l.nonEmpty && l.forall(_ > 0),
+        "The shape ladder should be a non-empty list of positive core counts")
+      .createOptional
+
+  val KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT =
+    ConfigBuilder("spark.kubernetes.executor.shape.downshiftTimeout")
+      .doc("How long an executor pod may stay unschedulable for lack of cpu or memory before " +
+        s"Spark replaces it with smaller executors from `${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}`.")
+      .version("5.0.0")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ > 0, "The downshift timeout should be positive")
+      .createWithDefaultString("60s")
+
+  val KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES =
+    ConfigBuilder("spark.kubernetes.executor.shape.initialCores")
+      .doc(s"The size in `${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}` to start from. Defaults to " +
+        "the largest size.")
+      .version("5.0.0")
+      .intConf
+      .createOptional
+
+  val KUBERNETES_EXECUTOR_SHAPE_CAPACITY_MISS_PATTERN =
+    ConfigBuilder("spark.kubernetes.executor.shape.capacityMissPattern")
+      .doc("Regular expression matched against the scheduler message of an unschedulable " +
+        "executor pod. Only a matching pod can trigger a move to a smaller executor size.")
+      .version("5.0.0")
+      .stringConf
+      .createWithDefault("Insufficient (cpu|memory)")
+
+  val KUBERNETES_EXECUTOR_SHAPE_CORES =
+    ConfigBuilder("spark.kubernetes.executor.shape.internal.cores")
+      .internal()
+      .doc("Cores of the executor pod being built. Set per pod by the pods allocator when " +
+        s"`${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}` is configured.")
+      .version("5.0.0")
+      .intConf
+      .createOptional
+
   val KUBERNETES_ALLOCATION_MAXIMUM =
     ConfigBuilder("spark.kubernetes.allocation.maximum")
       .doc("The maximum number of executor pods to try to create during the whole job lifecycle.")

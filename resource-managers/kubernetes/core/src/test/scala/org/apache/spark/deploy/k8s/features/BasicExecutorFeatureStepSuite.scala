@@ -888,6 +888,45 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     assert(memoryPolicy.get.getRestartPolicy === "NotRequired")
   }
 
+  test("SPARK-61258: a shape ladder pod keeps the memory per core of the reference shape") {
+    // Reference shape: 2 cores, 4g heap, 1g off-heap.
+    baseConf.set(EXECUTOR_CORES, 2)
+    baseConf.set(EXECUTOR_MEMORY.key, "4g")
+    baseConf.set(MEMORY_OFFHEAP_ENABLED, true)
+    baseConf.set(MEMORY_OFFHEAP_SIZE.key, "1g")
+    initDefaultProfile(baseConf)
+
+    def build(shapeCores: Option[Int]): (Map[String, String], Map[String, Quantity]) = {
+      shapeCores match {
+        case Some(c) => baseConf.set(KUBERNETES_EXECUTOR_SHAPE_CORES, c)
+        case None => baseConf.remove(KUBERNETES_EXECUTOR_SHAPE_CORES)
+      }
+      val step = new BasicExecutorFeatureStep(newExecutorConf(), defaultProfile)
+      val container = step.configurePod(SparkPod.initialPod()).container
+      val env = container.getEnv.asScala.map(e => e.getName -> e.getValue).toMap
+      (env, container.getResources.getRequests.asScala.toMap)
+    }
+
+    val (refEnv, refRequests) = build(None)
+    assert(refEnv(ENV_EXECUTOR_CORES) === "2")
+    assert(refEnv(ENV_EXECUTOR_MEMORY) === "4096m")
+    assert(amountAndFormat(refRequests("cpu")) === "2")
+    // 4096 heap + 409 overhead + 1024 off-heap
+    assert(amountAndFormat(refRequests("memory")) === "5529Mi")
+
+    val (env, requests) = build(Some(8))
+    assert(env(ENV_EXECUTOR_CORES) === "8")
+    assert(env(ENV_EXECUTOR_MEMORY) === "16384m")
+    assert(amountAndFormat(requests("cpu")) === "8")
+    // 16384 heap + 1638 overhead + 4096 off-heap
+    assert(amountAndFormat(requests("memory")) === "22118Mi")
+
+    // An explicit overhead is the reference shape's overhead and scales with the cores.
+    baseConf.set(EXECUTOR_MEMORY_OVERHEAD.key, "500m")
+    initDefaultProfile(baseConf)
+    assert(amountAndFormat(build(Some(8))._2("memory")) === s"${16384 + 2000 + 4096}Mi")
+  }
+
   test("SPARK-55639: ENV_EXECUTOR_CORES is spark.task.cpus when recoveryMode is enabled") {
     val rpb = new ResourceProfileBuilder()
     val ereq = new ExecutorResourceRequests()

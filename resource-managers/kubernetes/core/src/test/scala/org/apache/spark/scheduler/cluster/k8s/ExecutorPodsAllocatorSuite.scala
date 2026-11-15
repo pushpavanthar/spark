@@ -28,7 +28,7 @@ import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException
 import io.fabric8.kubernetes.client.dsl.PodResource
 import org.mockito.{ArgumentCaptor, Mock, MockitoAnnotations}
 import org.mockito.ArgumentMatchers.{any, anyString, eq => meq}
-import org.mockito.Mockito.{clearInvocations, never, times, verify, when}
+import org.mockito.Mockito.{atLeast, clearInvocations, never, times, verify, when}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 import org.scalatest.BeforeAndAfter
@@ -538,6 +538,152 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
     verify(podsWithNamespace, never()).resource(podWithAttachedContainerForId(2))
     verify(podResource, times(1)).create()
+  }
+
+  // Reference shape of 2 cores and 8g, so that every size of the ladder clears the overhead
+  // floor. One expected executor is worth 2 cores.
+  private def startShapeLadderAllocator(ladder: String, extraConf: (String, String)*): Unit = {
+    val ladderConf = conf.clone()
+      .set(EXECUTOR_CORES, 2)
+      .set(EXECUTOR_MEMORY.key, "8g")
+      .set(KUBERNETES_EXECUTOR_SHAPE_LADDER.key, ladder)
+      .set(KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT.key, "10s")
+    extraConf.foreach { case (k, v) => ladderConf.set(k, v) }
+    podsAllocatorUnderTest = new ExecutorPodsAllocator(ladderConf, secMgr, executorBuilder,
+      kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
+    podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
+    waitForExecutorPodsClock.setTime(Instant.now.toEpochMilli)
+  }
+
+  private def withShape(pod: Pod, cores: Int): Pod = {
+    new PodBuilder(pod)
+      .editMetadata().addToLabels(SPARK_EXECUTOR_SHAPE_CORES_LABEL, cores.toString).endMetadata()
+      .build()
+  }
+
+  // Sizes of all executor pods built so far, in request order.
+  private def requestedShapes(): Seq[Int] = {
+    val captor = ArgumentCaptor.forClass(classOf[KubernetesExecutorConf])
+    verify(executorBuilder, atLeast(0))
+      .buildFromFeatures(captor.capture(), meq(kubernetesClient), any(classOf[ResourceProfile]))
+    captor.getAllValues.asScala.map { c =>
+      assert(c.labels(SPARK_EXECUTOR_SHAPE_CORES_LABEL) ===
+        c.get(KUBERNETES_EXECUTOR_SHAPE_CORES).get.toString)
+      c.get(KUBERNETES_EXECUTOR_SHAPE_CORES).get
+    }.toSeq
+  }
+
+  test("SPARK-61258: shape ladder fills the target with the largest sizes that fit") {
+    startShapeLadderAllocator("8,4,2")
+    // 5 reference executors = 10 cores.
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 5))
+    assert(requestedShapes() === Seq(8, 2))
+
+    // Both pods run and the target is met in cores with 2 pods instead of 5.
+    snapshotsStore.updatePod(withShape(runningExecutor(1), 8))
+    snapshotsStore.updatePod(withShape(runningExecutor(2), 2))
+    snapshotsStore.notifySubscribers()
+    assert(requestedShapes() === Seq(8, 2))
+
+    // One more reference executor is one pod of the reference size, not of the ceiling.
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 6))
+    assert(requestedShapes() === Seq(8, 2, 2))
+  }
+
+  test("SPARK-61258: shape ladder moves down when a size cannot be scheduled") {
+    startShapeLadderAllocator("8,4,2")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 8))
+    assert(requestedShapes() === Seq(8, 8))
+
+    // One pod cannot be placed for lack of cpu, the other has not been looked at yet.
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1), 8))
+    snapshotsStore.updatePod(withShape(pendingExecutor(2), 8))
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods, never()).delete()
+    assert(requestedShapes() === Seq(8, 8))
+
+    // Past the timeout every pending pod of that size goes and the cores come back smaller.
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1", "2")
+    verify(labeledPods).delete()
+    assert(podsAllocatorUnderTest.isDeleted("1") && podsAllocatorUnderTest.isDeleted("2"))
+    assert(requestedShapes() === Seq(8, 8, 4, 4, 4, 4))
+  }
+
+  test("SPARK-61258: a running pod is never replaced by a downshift") {
+    startShapeLadderAllocator("8,4,2")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 8))
+    snapshotsStore.updatePod(withShape(runningExecutor(1), 8))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(2), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "2")
+    assert(requestedShapes() === Seq(8, 8, 4, 4))
+  }
+
+  test("SPARK-61258: a pod of the smallest size stays pending") {
+    startShapeLadderAllocator("4,2")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    assert(requestedShapes() === Seq(2))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1), 2))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods, never()).delete()
+    assert(requestedShapes() === Seq(2))
+  }
+
+  test("SPARK-61258: only a lack of cpu or memory moves the shape ladder down") {
+    startShapeLadderAllocator("8,4,2")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    assert(requestedShapes() === Seq(8))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1,
+      message = "0/3 nodes are available: 3 node(s) had untolerated taint."), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods, never()).delete()
+    assert(requestedShapes() === Seq(8))
+  }
+
+  test("SPARK-61258: excess pending pods are released in cores under a shape ladder") {
+    startShapeLadderAllocator("8,4,2")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 6))
+    assert(requestedShapes() === Seq(8, 4))
+    snapshotsStore.updatePod(withShape(pendingExecutor(1), 8))
+    snapshotsStore.updatePod(withShape(pendingExecutor(2), 4))
+    snapshotsStore.notifySubscribers()
+
+    // The target drops to 8 cores. The excess is 4 cores: the 4-core pod fits in it, the
+    // 8-core pod does not.
+    waitForExecutorPodsClock.advance(executorIdleTimeout * 2)
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "2")
+    verify(labeledPods, times(1)).delete()
+    assert(requestedShapes() === Seq(8, 4))
+  }
+
+  test("SPARK-61258: the pod-count limits still cap a shape ladder batch") {
+    startShapeLadderAllocator("4,2", KUBERNETES_ALLOCATION_BATCH_SIZE.key -> "2")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 8))
+    assert(requestedShapes() === Seq(4, 4))
+  }
+
+  test("SPARK-61258: recovery mode uses the smallest size of the shape ladder") {
+    startShapeLadderAllocator("8,4,2",
+      KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED.key -> "true")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 3))
+    assert(requestedShapes() === Seq(2, 2, 2))
+  }
+
+  test("SPARK-61258: initialCores sets the starting size of the shape ladder") {
+    startShapeLadderAllocator("8,4,2", KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES.key -> "4")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    assert(requestedShapes() === Seq(4, 4))
   }
 
   test("SPARK-34334: correctly identify timed out pending pod requests as excess") {

@@ -133,6 +133,21 @@ class KubernetesClusterManagerSuite extends SparkFunSuite with BeforeAndAfter {
     assert(e.getMessage.contains(KUBERNETES_EXECUTOR_POD_DELETION_COST.key))
   }
 
+  test("SPARK-61258: a shape ladder fails fast without the direct pods allocator") {
+    val manager = new KubernetesClusterManager()
+    sparkConf.set(KUBERNETES_EXECUTOR_SHAPE_LADDER.key, "4,2,1")
+    sparkConf.set("spark.executor.memory", "4g")
+    Seq("statefulset", "deployment").foreach { allocator =>
+      sparkConf.set(KUBERNETES_ALLOCATION_PODS_ALLOCATOR, allocator)
+      val e = intercept[SparkException] {
+        manager.makeExecutorPodsAllocator(sc, kubernetesClient, null)
+      }
+      assert(e.getMessage.contains(KUBERNETES_EXECUTOR_SHAPE_LADDER.key))
+    }
+    sparkConf.remove(KUBERNETES_EXECUTOR_SHAPE_LADDER.key)
+    sparkConf.remove(KUBERNETES_ALLOCATION_PODS_ALLOCATOR.key)
+  }
+
   test("deployment allocator with dynamic allocation and deletion cost succeeds") {
     val manager = new KubernetesClusterManager()
     sparkConf.set(KUBERNETES_ALLOCATION_PODS_ALLOCATOR, "deployment")

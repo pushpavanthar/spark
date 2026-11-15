@@ -74,15 +74,24 @@ private[spark] class BasicExecutorFeatureStep(
     kubernetesConf.get(MEMORY_OVERHEAD_FACTOR)
   }
 
-  val execResources = ResourceProfile.getResourcesForClusterManager(
-    resourceProfile.id,
-    resourceProfile.executorResources,
-    minimumMemoryOverhead,
-    memoryOverheadFactor,
-    kubernetesConf.sparkConf,
-    isPythonApp,
-    Map.empty)
-  assert(execResources.cores.nonEmpty)
+  val execResources = {
+    val profileResources = ResourceProfile.getResourcesForClusterManager(
+      resourceProfile.id,
+      resourceProfile.executorResources,
+      minimumMemoryOverhead,
+      memoryOverheadFactor,
+      kubernetesConf.sparkConf,
+      isPythonApp,
+      Map.empty)
+    assert(profileResources.cores.nonEmpty)
+    // With a shape ladder the allocator picks the size of each pod; the profile only gives
+    // the memory per core.
+    kubernetesConf.get(KUBERNETES_EXECUTOR_SHAPE_CORES) match {
+      case Some(shapeCores) if isDefaultProfile =>
+        ShapeLadder.resourcesFor(profileResources, shapeCores, kubernetesConf.sparkConf)
+      case _ => profileResources
+    }
+  }
 
   private val executorMemoryString = s"${execResources.executorMemoryMiB}m"
   // we don't include any kubernetes conf specific requests or limits when using custom

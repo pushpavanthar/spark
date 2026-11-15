@@ -22,7 +22,7 @@ import io.fabric8.kubernetes.client.Config
 import io.fabric8.kubernetes.client.KubernetesClient
 
 import org.apache.spark.{SparkConf, SparkContext, SparkException, SparkMasterRegex}
-import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils, SparkKubernetesClientFactory}
+import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils, ShapeLadder, SparkKubernetesClientFactory}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants.DEFAULT_EXECUTOR_CONTAINER_NAME
 import org.apache.spark.internal.Logging
@@ -165,6 +165,8 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       snapshotsStore: ExecutorPodsSnapshotsStore,
       lifecycleManager: Option[ExecutorPodsLifecycleManager] = None) = {
     val allocator = sc.conf.get(KUBERNETES_ALLOCATION_PODS_ALLOCATOR)
+    // Fail fast on a shape ladder that cannot be honored, whatever the allocator.
+    ShapeLadder.fromConf(sc.conf)
     if (allocator == "deployment" && Utils.isDynamicAllocationEnabled(sc.conf) &&
       sc.conf.get(KUBERNETES_EXECUTOR_POD_DELETION_COST).isEmpty) {
       throw new SparkException(
