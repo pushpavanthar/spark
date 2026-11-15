@@ -13,23 +13,8 @@ import org.scalatest.funsuite.AnyFunSuite
 class SchedulerSimSuite extends AnyFunSuite {
   private val group = "measure"
 
-  /** Runs the workload once to warm the JVM, then once under the measured job group. */
-  private def realRun(cores: Int): RunModel = {
-    val logDir = Files.createTempDirectory(s"replay-sim-$cores").toFile
-    val spark = Harness.session(Map("spark.eventLog.enabled" -> "true",
-      "spark.eventLog.dir" -> logDir.toURI.toString), cores)
-    spark.sparkContext.setLogLevel("ERROR")
-    try {
-      Harness.prepare(spark)
-      Harness.setConf(spark, Map())
-      def workload(): Unit = Harness.queries.foreach { case (_, sql) => spark.sql(sql).collect() }
-      workload()
-      spark.sparkContext.setJobGroup(group, "measured workload")
-      workload()
-    } finally spark.stop()
-    val log = logDir.listFiles().filter(f => f.isFile && f.getName.startsWith("local-")).head
-    EventLogReader.read(log.getPath).onlyGroup(group)
-  }
+  private def realRun(cores: Int): RunModel =
+    EventLogReader.read(Harness.runWithEventLog(cores, group)).onlyGroup(group)
 
   test("replaying a run at its own and at other core counts predicts the real span") {
     val real = Seq(2, 4, 8).map(c => c -> realRun(c)).toMap

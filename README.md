@@ -50,6 +50,21 @@ opaque node, and that five config what-ifs give the plan of a real rerun or carr
 The engine needs the Iceberg runtime jar on its classpath to replay plans that write Iceberg
 tables. Not covered: Comet.
 
+## Simulator trace export
+
+`AroTrace.export(eventLog, outDir)` writes `outDir/<app-id>/trace.json.gz` in the trace format of the
+adaptive-resource-simulator (`aro_sim`, schema 1), so its `simulate` and `check` commands can replay a
+run straight from an event log. Stage parents are the event log's exact ones, written under the
+simulator's field name `parents_inferred`. All Spark properties are exported, not only the ones the
+simulator reads. In local mode the driver is exported as the only executor.
+
+```
+spark-submit --class org.apache.spark.sql.replay.AroTrace distiller.jar <event-log> <out-dir>
+```
+
+Only the recorded run is exported. A trace rewritten for a config what-if (new partition counts
+from the plan replay) is not built.
+
 ## Flags
 
 A prediction carries a flag whenever it used something the run did not record.

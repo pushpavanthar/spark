@@ -25,6 +25,14 @@ case class RunModel(jobs: Seq[JobRun], executors: Seq[ExecutorRun]) {
 /** Reads the jobs, stages, tasks and executors of one application from its event log. */
 object EventLogReader {
   def read(logPath: String, hadoopConf: Configuration = new Configuration()): RunModel = {
+    val collector = new Collector
+    replay(logPath, hadoopConf, Seq(collector))
+    collector.model
+  }
+
+  /** Feeds every event of the log to the listeners, in order. */
+  def replay(logPath: String, hadoopConf: Configuration,
+      listeners: Seq[SparkListenerInterface]): Unit = {
     val path = new Path(logPath)
     val fs = path.getFileSystem(hadoopConf)
     val reader = EventLogFileReader(fs, path)
@@ -34,14 +42,12 @@ object EventLogReader {
     files.find(EventLogFileWriter.isCompacted).foreach { f =>
       throw new IllegalArgumentException(s"compacted event log is not usable: $f")
     }
-    val collector = new Collector
     val bus = new ReplayListenerBus()
-    bus.addListener(collector)
+    listeners.foreach(bus.addListener)
     files.foreach { f =>
       val in = EventLogFileReader.openEventLog(f, fs)
       try bus.replay(in, f.getName) finally in.close()
     }
-    collector.model
   }
 
   private class Collector extends SparkListener {

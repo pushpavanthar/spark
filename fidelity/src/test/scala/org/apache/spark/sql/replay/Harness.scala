@@ -4,6 +4,7 @@
 package org.apache.spark.sql.replay
 
 import java.io.{File, PrintWriter}
+import java.nio.file.Files
 
 import scala.io.Source
 
@@ -190,6 +191,26 @@ object Harness {
       .config("spark.ui.enabled", "false").config("spark.sql.sources.useV1SourceList", "parquet")
     conf.foreach { case (k, v) => b.config(k, v) }
     b.withExtensions(Replay.install _).getOrCreate()
+  }
+
+  /**
+   * Really runs the workload with event logging: once to warm the JVM, then once under the job
+   * group. Returns the event log.
+   */
+  def runWithEventLog(cores: Int, group: String, conf: Map[String, String] = Map()): String = {
+    val logDir = Files.createTempDirectory(s"replay-log-$cores").toFile
+    val spark = session(conf ++ Map("spark.eventLog.enabled" -> "true",
+      "spark.eventLog.dir" -> logDir.toURI.toString), cores)
+    spark.sparkContext.setLogLevel("ERROR")
+    try {
+      prepare(spark)
+      setConf(spark, Map())
+      def workload(): Unit = queries.foreach { case (_, sql) => spark.sql(sql).collect() }
+      workload()
+      spark.sparkContext.setJobGroup(group, "measured workload")
+      workload()
+    } finally spark.stop()
+    logDir.listFiles().filter(f => f.isFile && f.getName.startsWith("local-")).head.getPath
   }
 
   /** Registers capture the way an application would, plus a collector for its events. */
