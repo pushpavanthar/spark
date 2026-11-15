@@ -34,6 +34,9 @@ private[spark] case class ShapeLadder(rungs: Seq[Int], referenceCores: Int) {
 
   val smallest: Int = rungs.last
 
+  /** The smallest size above `cores`, if any. */
+  def rungAbove(cores: Int): Option[Int] = rungs.findLast(_ > cores)
+
   /** The largest size below `cores`, or the smallest size if there is none. */
   def rungBelow(cores: Int): Int = rungs.find(_ < cores).getOrElse(smallest)
 
@@ -81,6 +84,23 @@ private[spark] object ShapeLadder {
       }
       if (rungs.last < taskCpus) {
         reject(s"the smallest size ${rungs.last} is below ${CPUS_PER_TASK.key}=$taskCpus.")
+      }
+      if (!conf.get(KUBERNETES_EXECUTOR_SHAPE_ALLOW_WASTED_SLOTS)) {
+        rungs.find(r => !(BigDecimal(r) / taskCpus).isWhole).foreach { rung =>
+          reject(s"$rung is not a multiple of ${CPUS_PER_TASK.key}=$taskCpus and would leave " +
+            s"cores no task can use; set ${KUBERNETES_EXECUTOR_SHAPE_ALLOW_WASTED_SLOTS.key} " +
+            "to allow it.")
+        }
+      }
+      if (conf.get(KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT) >=
+          conf.get(KUBERNETES_ALLOCATION_EXECUTOR_TIMEOUT)) {
+        reject(s"${KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT.key} must be shorter than " +
+          s"${KUBERNETES_ALLOCATION_EXECUTOR_TIMEOUT.key}.")
+      }
+      if (conf.get(KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_INTERVAL) >
+          conf.get(KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_MAX_INTERVAL)) {
+        reject(s"${KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_INTERVAL.key} must not exceed " +
+          s"${KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_MAX_INTERVAL.key}.")
       }
       conf.get(KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES).filterNot(rungs.contains).foreach { c =>
         reject(s"${KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES.key}=$c is not one of the sizes.")

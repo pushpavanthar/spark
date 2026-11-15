@@ -113,6 +113,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
     super.start()
     // Must be called before setting the executors
     podAllocator.start(applicationId(), this)
+    podAllocator match {
+      case allocator: ExecutorPodsAllocator =>
+        Option(allocator.shapeLadderSource).flatten
+          .foreach(scheduler.sc.env.metricsSystem.registerSource)
+      case _ =>
+    }
     // SPARK-38794: Create the executor ConfigMap before requesting executors. Executor
     // allocation is asynchronous (background thread pool), so requesting executors first
     // can race with ConfigMap creation, causing transient "configmap ... not found" mounts.

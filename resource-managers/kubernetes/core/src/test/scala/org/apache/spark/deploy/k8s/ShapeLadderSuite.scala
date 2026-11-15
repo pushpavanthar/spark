@@ -70,6 +70,28 @@ class ShapeLadderSuite extends SparkFunSuite {
     assertRejected(baseConf.set(CPUS_PER_TASK, BigDecimal(8)), "below spark.task.cpus=8")
   }
 
+  test("a size must be a multiple of the task cpus unless wasted slots are allowed") {
+    val conf = baseConf.set(CPUS_PER_TASK, BigDecimal(3))
+    assertRejected(conf, "is not a multiple of spark.task.cpus=3")
+    assert(ShapeLadder.fromConf(
+      conf.set(KUBERNETES_EXECUTOR_SHAPE_ALLOW_WASTED_SLOTS, true)).nonEmpty)
+    assert(ShapeLadder.fromConf(baseConf.set(CPUS_PER_TASK, BigDecimal(0.5))).nonEmpty)
+  }
+
+  test("timeouts must be ordered") {
+    assertRejected(baseConf.set(KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT.key, "10min"),
+      KUBERNETES_ALLOCATION_EXECUTOR_TIMEOUT.key)
+    assertRejected(baseConf.set(KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_INTERVAL.key, "2h"),
+      KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_MAX_INTERVAL.key)
+  }
+
+  test("ladder navigation") {
+    val ladder = ShapeLadder(Seq(16, 8, 4), 4)
+    assert(ladder.rungAbove(4) === Some(8))
+    assert(ladder.rungAbove(8) === Some(16))
+    assert(ladder.rungAbove(16) === None)
+  }
+
   test("initialCores must be one of the sizes") {
     assertRejected(baseConf.set(KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES, 12), "initialCores=12")
     assert(ShapeLadder.fromConf(baseConf.set(KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES, 8)).nonEmpty)

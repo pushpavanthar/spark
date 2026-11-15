@@ -151,8 +151,39 @@ class ExecutorPodsAllocator(
     conf.get(KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES)
       .orElse(shapeLadder.map(_.rungs.head)).getOrElse(0)
 
-  // Executor ID -> time its pod was first seen unschedulable for lack of cpu or memory.
-  private val capacityMissSince = mutable.HashMap.empty[Long, Long]
+  private val shapeFallbackTimeout =
+    conf.get(KUBERNETES_EXECUTOR_SHAPE_CAPACITY_MISS_FALLBACK_TIMEOUT)
+
+  private val shapeUpshiftInterval = conf.get(KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_INTERVAL)
+
+  private val shapeUpshiftMaxInterval = conf.get(KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_MAX_INTERVAL)
+
+  private val shapeProbePriorityClass = conf.get(KUBERNETES_EXECUTOR_SHAPE_PROBE_PRIORITY_CLASS)
+
+  // Turned off for good when the driver turns out not to be allowed to list events.
+  @volatile private var shapeReadAutoscalerEvents =
+    conf.get(KUBERNETES_EXECUTOR_SHAPE_READ_AUTOSCALER_EVENTS)
+
+  /** Metrics of the shape ladder, registered by the scheduler backend. */
+  val shapeLadderSource: Option[ShapeLadderSource] =
+    shapeLadder.map(_ => new ShapeLadderSource(() => shapeCeilingCores))
+
+  // Executor ID -> time its pod was first seen unschedulable.
+  private val unschedulableSince = mutable.HashMap.empty[Long, Long]
+
+  // Executor ID -> (time its events were last read, reason of the latest autoscaler event).
+  private val autoscalerEvents = mutable.HashMap.empty[Long, (Long, Option[String])]
+
+  // The pod that is testing whether the size above the ceiling fits again, if any. A probe is
+  // sent only after a pod was placed without trouble since the ceiling last moved down, and
+  // not before nextProbeTime. The wait doubles each time a probe fails.
+  private var probeExecutorId: Option[Long] = None
+  private var probeBackoff = shapeUpshiftInterval
+  private var nextProbeTime = clock.getTimeMillis() + shapeUpshiftInterval
+  private var lastProbeSuccessTime = -1L
+  private var placedSinceDownshift = false
+  private val everUnschedulable = mutable.HashSet.empty[Long]
+  private val seenRunning = mutable.HashSet.empty[Long]
 
   // Executor ID -> size in cores, for pods requested but not yet seen in a snapshot.
   private val newlyCreatedShapeCores = mutable.HashMap.empty[Long, Int]
@@ -305,9 +336,24 @@ class ExecutorPodsAllocator(
         newlyCreatedExecutors.contains(id) || schedulerKnownNewlyCreatedExecs.contains(id)
       }
       val candidates = lastSnapshot.executorPods.filter { case (id, _) =>
-        !_deletedExecutorIds.contains(id) && !schedulerKnownExecs.contains(id)
+        !_deletedExecutorIds.contains(id)
       }
-      val tooLarge = podsAboveShapeCeiling(ladder, candidates, currentTime)
+      val (tooLarge, probeToReplace) =
+        reconcileShapeLadder(ladder, candidates, schedulerKnownExecs, currentTime)
+      probeToReplace.foreach { id =>
+        logInfo(log"Replacing probe executor ${MDC(LogKeys.EXECUTOR_ID, id)}: it showed that " +
+          log"the size fits and gives way to a pod without the probe PriorityClass.")
+        _deletedExecutorIds = _deletedExecutorIds + id
+        Utils.tryLogNonFatalError {
+          kubernetesClient
+            .pods()
+            .inNamespace(namespace)
+            .withLabel(SPARK_APP_ID_LABEL, applicationId)
+            .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+            .withLabelIn(SPARK_EXECUTOR_ID_LABEL, id.toString)
+            .delete()
+        }
+      }
       if (tooLarge.nonEmpty) {
         _deletedExecutorIds = _deletedExecutorIds ++ tooLarge
         Utils.tryLogNonFatalError {
@@ -507,16 +553,19 @@ class ExecutorPodsAllocator(
         val remainingSlotsForRpId = maxPendingPodsPerRpid - pendingPodCountForRpId
         // With a shape ladder targetNum and podCountForRpId are in cores, and the missing cores
         // are covered by pods of the largest sizes that fit under the current ceiling.
-        val shapesToAllocate =
-          shapeLadder.filter(_ => rpId == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID).map { l =>
-            val ceiling = if (conf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED)
-                .getOrElse(false)) {
-              l.smallest
-            } else {
-              shapeCeilingCores
-            }
-            l.greedyFill(ceiling, targetNum - podCountForRpId)
-          }
+        val ladderForRpId =
+          shapeLadder.filter(_ => rpId == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+        val recoveryMode = conf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED).getOrElse(false)
+        val missingCores = targetNum - podCountForRpId
+        // One pod of the size above the ceiling, to learn whether that size fits again.
+        val probeCores = ladderForRpId.flatMap(_.rungAbove(shapeCeilingCores)).filter { cores =>
+          !recoveryMode && probeExecutorId.isEmpty && placedSinceDownshift &&
+            currentTime >= nextProbeTime && cores <= missingCores
+        }
+        val shapesToAllocate = ladderForRpId.map { l =>
+          val ceiling = if (recoveryMode) l.smallest else shapeCeilingCores
+          probeCores.toSeq ++ l.greedyFill(ceiling, missingCores - probeCores.getOrElse(0))
+        }
         val numMissingPodsForRpId =
           shapesToAllocate.map(_.size).getOrElse(targetNum - podCountForRpId)
         val numExecutorsToAllocate = Seq(numMissingPodsForRpId, podAllocationSize,
@@ -528,7 +577,7 @@ class ExecutorPodsAllocator(
           log"known: ${MDC(LogKeys.NUM_POD, podCountForRpId)}, sharedSlotFromPendingPods: " +
           log"${MDC(LogKeys.NUM_POD_SHARED_SLOT, sharedSlotFromPendingPods)}.")
         requestNewExecutors(numExecutorsToAllocate, applicationId, rpId, k8sKnownPVCNames,
-          shapesToAllocate.getOrElse(Nil))
+          shapesToAllocate.getOrElse(Nil), probeFirst = probeCores.isDefined)
       }
     }
     deletedExecutorIds = _deletedExecutorIds
@@ -546,48 +595,147 @@ class ExecutorPodsAllocator(
   }
 
   /**
-   * Lowers the shape ceiling when a pod has been unschedulable for lack of cpu or memory for
-   * longer than the downshift timeout, and returns the pending pods that are larger than the
-   * ceiling. The caller deletes them and the freed cores are requested again at smaller sizes.
-   * A pod of the smallest size stays pending, as without a ladder, and a pod that is
-   * unschedulable for any other reason (taint, affinity, volume) never lowers the ceiling.
+   * Moves the shape ceiling and returns the pods the caller has to delete:
+   *  - the pending pods that are larger than the ceiling, after a pod has been unschedulable
+   *    for lack of cpu or memory for longer than the downshift timeout. Their cores are
+   *    requested again at smaller sizes. A pod of the smallest size stays pending, as without
+   *    a ladder, and a pod that is unschedulable for another reason (taint, affinity, volume)
+   *    lowers the ceiling only after the much longer fallback timeout.
+   *  - a probe that was scheduled under the probe PriorityClass, which must not keep that
+   *    class for its whole life. A scheduled probe raises the ceiling to its size.
    */
-  private def podsAboveShapeCeiling(
+  private def reconcileShapeLadder(
       ladder: ShapeLadder,
       pods: Map[Long, ExecutorPodState],
-      currentTime: Long): Set[Long] = {
-    val pendingCores = pods.collect {
-      case (id, state: PendingPodState)
-          if state.pod.getMetadata.getLabels.containsKey(SPARK_EXECUTOR_SHAPE_CORES_LABEL) =>
+      schedulerKnownExecs: Set[Long],
+      currentTime: Long): (Set[Long], Option[Long]) = {
+    val shaped = pods.filter { case (_, state) =>
+      state.pod.getMetadata.getLabels.containsKey(SPARK_EXECUTOR_SHAPE_CORES_LABEL)
+    }
+    // A pod that runs without ever having been unschedulable shows there is room.
+    shaped.foreach {
+      case (id, _: PodUnschedulable) => everUnschedulable += id
+      case (id, _: PodRunning) =>
+        if (seenRunning.add(id) && !everUnschedulable.contains(id)) placedSinceDownshift = true
+      case _ =>
+    }
+    everUnschedulable.filterInPlace(shaped.contains)
+    seenRunning.filterInPlace(shaped.contains)
+
+    var probeToReplace = Option.empty[Long]
+    probeExecutorId.foreach { id =>
+      pods.get(id) match {
+        case Some(PodRunning(pod)) =>
+          val cores = shapeCores(ladder, pod)
+          if (cores > shapeCeilingCores) {
+            logInfo(log"Executor pods of ${MDC(LogKeys.NUM_CORES, cores)} cores fit again; " +
+              log"moving the shape ladder up.")
+            shapeCeilingCores = cores
+          }
+          probeBackoff = shapeUpshiftInterval
+          nextProbeTime = currentTime + probeBackoff
+          lastProbeSuccessTime = currentTime
+          if (shapeProbePriorityClass.isDefined && !schedulerKnownExecs.contains(id)) {
+            probeToReplace = Some(id)
+          }
+          probeExecutorId = None
+        case Some(_: PendingPodState) =>
+        case None if newlyCreatedShapeCores.contains(id) =>
+        case _ => probeExecutorId = None
+      }
+    }
+
+    val pendingCores = shaped.collect {
+      case (id, state: PendingPodState) if !schedulerKnownExecs.contains(id) =>
         id -> shapeCores(ladder, state.pod)
     }
-    val misses = pods.collect {
-      case (id, PodUnschedulable(_, message))
-          if pendingCores.get(id).exists(_ > ladder.smallest) &&
-            shapeCapacityMissPattern.findFirstIn(message).nonEmpty => id
-    }.toSet
-    capacityMissSince.filterInPlace { case (id, _) => misses.contains(id) }
-    misses.foreach(capacityMissSince.getOrElseUpdate(_, currentTime))
-    val expired = capacityMissSince.collect {
-      case (id, since) if currentTime - since >= shapeDownshiftTimeout => id
+    val stuck = shaped.collect {
+      case (id, state: PodUnschedulable) if pendingCores.get(id).exists(_ > ladder.smallest) =>
+        id -> state
     }
+    unschedulableSince.filterInPlace { case (id, _) => stuck.contains(id) }
+    autoscalerEvents.filterInPlace { case (id, _) => stuck.contains(id) }
+    val expired = stuck.collect { case (id, state) if {
+        val age = currentTime - unschedulableSince.getOrElseUpdate(id, currentTime)
+        val capacityMiss = shapeCapacityMissPattern.findFirstIn(state.message).nonEmpty
+        age >= shapeFallbackTimeout || (capacityMiss &&
+          (latestAutoscalerEvent(id, state.pod, currentTime) match {
+            case Some("NotTriggerScaleUp") => true
+            case Some(_) => false
+            case None => age >= shapeDownshiftTimeout
+          }))
+      } => id
+    }.toSet
     if (expired.nonEmpty) {
-      val newCeiling = ladder.rungBelow(expired.map(pendingCores).min)
+      val missedCores = expired.map(pendingCores).min
+      val newCeiling = ladder.rungBelow(missedCores)
+      val probeFailed = probeExecutorId.exists(expired.contains)
+      // A miss right after a probe said the size fits: the room was not there to stay.
+      val missAfterProbe = lastProbeSuccessTime >= 0 &&
+        currentTime - lastProbeSuccessTime <= 2 * shapeDownshiftTimeout
       if (newCeiling < shapeCeilingCores) {
         logInfo(log"Kubernetes could not fit executor pods of " +
-          log"${MDC(LogKeys.NUM_CORES, expired.map(pendingCores).min)} cores within " +
-          log"${MDC(LogKeys.TIMEOUT, shapeDownshiftTimeout)} ms; moving the shape ladder down " +
+          log"${MDC(LogKeys.NUM_CORES, missedCores)} cores; moving the shape ladder down " +
           log"to ${MDC(LogKeys.COUNT, newCeiling)} cores per executor.")
         shapeCeilingCores = newCeiling
+        shapeLadderSource.foreach(_.downshifts.inc())
       }
+      if (probeFailed || missAfterProbe) {
+        probeBackoff = math.min(probeBackoff * 2, shapeUpshiftMaxInterval)
+      }
+      if (probeFailed) probeExecutorId = None
+      nextProbeTime = currentTime + probeBackoff
+      placedSinceDownshift = false
     }
     val tooLarge = if (expired.nonEmpty) {
       pendingCores.collect { case (id, cores) if cores > shapeCeilingCores => id }.toSet
     } else {
       Set.empty[Long]
     }
-    capacityMissSince --= tooLarge
-    tooLarge
+    unschedulableSince --= tooLarge
+    (tooLarge, probeToReplace)
+  }
+
+  /**
+   * Reason of the latest autoscaler event of an unschedulable pod: TriggeredScaleUp or
+   * Nominated when a node is on its way, NotTriggerScaleUp when none will come. None when
+   * events are not read or say nothing. Events are read at most every few seconds per pod.
+   */
+  private def latestAutoscalerEvent(id: Long, pod: Pod, currentTime: Long): Option[String] = {
+    if (!shapeReadAutoscalerEvents) {
+      None
+    } else {
+      autoscalerEvents.get(id) match {
+        case Some((readAt, reason)) if currentTime - readAt <
+            ExecutorPodsAllocator.AUTOSCALER_EVENTS_REFRESH_MS =>
+          reason
+        case _ =>
+          val reason = try {
+            readPodEvents(pod.getMetadata.getName)
+              .filter { case (reason, _) =>
+                ExecutorPodsAllocator.AUTOSCALER_EVENT_REASONS.contains(reason)
+              }
+              .sortBy(_._2).lastOption.map(_._1)
+          } catch {
+            case e: KubernetesClientException =>
+              logWarning(log"Cannot read pod events; " +
+                log"${MDC(LogKeys.CONFIG, KUBERNETES_EXECUTOR_SHAPE_READ_AUTOSCALER_EVENTS.key)}" +
+                log" is ignored from now on. The driver needs permission to list events.", e)
+              shapeReadAutoscalerEvents = false
+              None
+          }
+          autoscalerEvents(id) = (currentTime, reason)
+          reason
+      }
+    }
+  }
+
+  /** (reason, last timestamp) of the events of a pod. */
+  protected def readPodEvents(podName: String): Seq[(String, String)] = {
+    kubernetesClient.v1().events().inNamespace(namespace)
+      .withField("involvedObject.name", podName)
+      .list().getItems.asScala.toSeq
+      .map(e => (e.getReason, Option(e.getLastTimestamp).getOrElse("")))
   }
 
   protected def getReusablePVCs(applicationId: String, pvcsInUse: Set[String]) = {
@@ -669,7 +817,8 @@ class ExecutorPodsAllocator(
       applicationId: String,
       resourceProfileId: Int,
       pvcsInUse: Set[String],
-      shapes: Seq[Int] = Nil): Unit = {
+      shapes: Seq[Int] = Nil,
+      probeFirst: Boolean = false): Unit = {
     // Check reusable PVCs for this executor allocation batch
     val reusablePVCs = getReusablePVCs(applicationId, pvcsInUse)
     for (i <- 0 until numExecutorsToAllocate) {
@@ -702,9 +851,13 @@ class ExecutorPodsAllocator(
       val resolvedExecutorSpec = executorBuilder.buildFromFeatures(executorConf,
         kubernetesClient, rpIdToResourceProfile(resourceProfileId))
       val executorPod = resolvedExecutorSpec.pod
+      val isProbe = probeFirst && i == 0
       val podWithAttachedContainer = new PodBuilder(executorPod.pod)
         .editOrNewSpec()
         .addToContainers(executorPod.container)
+        .withPriorityClassName(
+          shapeProbePriorityClass.filter(_ => isProbe).getOrElse(
+            executorPod.pod.getSpec.getPriorityClassName))
         .endSpec()
         .build()
       val resources = replacePVCsIfNeeded(
@@ -745,6 +898,12 @@ class ExecutorPodsAllocator(
             }
           newlyCreatedExecutors(newExecutorId) = (resourceProfileId, clock.getTimeMillis())
           shape.foreach(newlyCreatedShapeCores(newExecutorId) = _)
+          if (isProbe) {
+            logInfo(log"Executor ${MDC(LogKeys.EXECUTOR_ID, newExecutorId)} probes whether " +
+              log"executors of ${MDC(LogKeys.NUM_CORES, shape.get)} cores fit again.")
+            probeExecutorId = Some(newExecutorId.toLong)
+            shapeLadderSource.foreach(_.upshiftProbes.inc())
+          }
           logDebug(s"Requested executor with id $newExecutorId from Kubernetes.")
         } catch {
           case NonFatal(e) =>
@@ -830,6 +989,11 @@ class ExecutorPodsAllocator(
 }
 
 private[spark] object ExecutorPodsAllocator {
+
+  private val AUTOSCALER_EVENT_REASONS = Set("TriggeredScaleUp", "Nominated", "NotTriggerScaleUp")
+
+  // How often the events of one unschedulable pod are read again.
+  private val AUTOSCALER_EVENTS_REFRESH_MS = 10000L
 
   // A utility function to split the available slots among the specified consumers
   def splitSlots[T](consumers: Seq[T], slots: Int): Seq[(T, Int)] = {

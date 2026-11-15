@@ -549,11 +549,166 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       .set(KUBERNETES_EXECUTOR_SHAPE_LADDER.key, ladder)
       .set(KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT.key, "10s")
     extraConf.foreach { case (k, v) => ladderConf.set(k, v) }
+    waitForExecutorPodsClock.setTime(Instant.now.toEpochMilli)
     podsAllocatorUnderTest = new ExecutorPodsAllocator(ladderConf, secMgr, executorBuilder,
-      kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+        kubernetesClient, snapshotsStore, waitForExecutorPodsClock) {
+      override protected def readPodEvents(podName: String): Seq[(String, String)] = podEvents
+    }
     podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
-    waitForExecutorPodsClock.setTime(Instant.now.toEpochMilli)
+  }
+
+  // (reason, last timestamp) of the events the allocator reads for any pod.
+  private var podEvents = Seq.empty[(String, String)]
+
+  // Ladder 8,4,2 with executors 1 (8 cores, deleted) and 2, 3 (4 cores, running): the 8-core
+  // size did not fit, the ceiling is at 4 cores and pods have been placed since.
+  private def startShapeLadderAllocatorAtFourCores(extraConf: (String, String)*): Unit = {
+    startShapeLadderAllocator("8,4,2",
+      (KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_INTERVAL.key -> "60s") +: extraConf: _*)
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    assert(requestedShapes() === Seq(8, 4, 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(2), 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(3), 4))
+    snapshotsStore.notifySubscribers()
+  }
+
+  // Raises the target by 8 cores and returns the sizes requested for them.
+  private var shapeLadderTarget = 4
+  private def requestEightMoreCores(): Seq[Int] = {
+    val before = requestedShapes().size
+    shapeLadderTarget += 4
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> shapeLadderTarget))
+    snapshotsStore.notifySubscribers()
+    requestedShapes().drop(before)
+  }
+
+  test("SPARK-61258: a larger size is probed with one pod and adopted when it is scheduled") {
+    shapeLadderTarget = 4
+    startShapeLadderAllocatorAtFourCores()
+    val source = podsAllocatorUnderTest.shapeLadderSource.get
+    assert(source.downshifts.getCount === 1)
+
+    // Too early for a probe.
+    assert(requestEightMoreCores() === Seq(4, 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(4), 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(5), 4))
+    snapshotsStore.notifySubscribers()
+
+    // After the interval the next 8 cores go out as one 8-core probe.
+    waitForExecutorPodsClock.advance(60000)
+    assert(requestEightMoreCores() === Seq(8))
+    assert(source.upshiftProbes.getCount === 1)
+
+    // While the probe is pending, further cores stay at the proven size.
+    snapshotsStore.updatePod(withShape(pendingExecutor(6), 8))
+    assert(requestEightMoreCores() === Seq(4, 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(7), 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(8), 4))
+
+    // The probe runs: 8 cores is the size again.
+    snapshotsStore.updatePod(withShape(runningExecutor(6), 8))
+    snapshotsStore.notifySubscribers()
+    assert(requestEightMoreCores() === Seq(8))
+    assert(source.upshiftProbes.getCount === 1)
+    assert(source.downshifts.getCount === 1)
+  }
+
+  test("SPARK-61258: a probe that does not fit doubles the wait for the next one") {
+    shapeLadderTarget = 4
+    startShapeLadderAllocatorAtFourCores()
+    waitForExecutorPodsClock.advance(60000)
+    assert(requestEightMoreCores() === Seq(8))
+
+    // The probe (executor 4) cannot be placed: it goes and its cores come back at 4 cores.
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(4), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "4")
+    assert(requestedShapes().takeRight(2) === Seq(4, 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(5), 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(6), 4))
+    snapshotsStore.notifySubscribers()
+
+    // One interval later there is no probe yet, two intervals later there is.
+    waitForExecutorPodsClock.advance(60000)
+    assert(requestEightMoreCores() === Seq(4, 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(7), 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(8), 4))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(60000)
+    assert(requestEightMoreCores() === Seq(8))
+    assert(podsAllocatorUnderTest.shapeLadderSource.get.upshiftProbes.getCount === 2)
+  }
+
+  test("SPARK-61258: a scheduled probe gives way to a pod without the probe PriorityClass") {
+    shapeLadderTarget = 4
+    startShapeLadderAllocatorAtFourCores(
+      KUBERNETES_EXECUTOR_SHAPE_PROBE_PRIORITY_CLASS.key -> "spark-probe")
+    val podCaptor = ArgumentCaptor.forClass(classOf[Pod])
+    def priorityClasses(): Seq[String] = {
+      verify(podsWithNamespace, atLeast(0)).resource(podCaptor.capture())
+      podCaptor.getAllValues.asScala.toSeq.takeRight(requestedShapes().size)
+        .map(_.getSpec.getPriorityClassName)
+    }
+    waitForExecutorPodsClock.advance(60000)
+    assert(requestEightMoreCores() === Seq(8))
+    assert(priorityClasses().last === "spark-probe")
+    assert(priorityClasses().dropRight(1).forall(_ == null))
+
+    // The probe (executor 4) is scheduled before its executor registers: it is replaced.
+    snapshotsStore.updatePod(withShape(runningExecutor(4), 8))
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "4")
+    assert(podsAllocatorUnderTest.isDeleted("4"))
+    assert(requestedShapes().last === 8)
+    assert(priorityClasses().last === null)
+  }
+
+  test("SPARK-61258: autoscaler events shorten or extend the wait for a size") {
+    startShapeLadderAllocator("8,4,2",
+      KUBERNETES_EXECUTOR_SHAPE_READ_AUTOSCALER_EVENTS.key -> "true",
+      KUBERNETES_EXECUTOR_SHAPE_CAPACITY_MISS_FALLBACK_TIMEOUT.key -> "5min")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    assert(requestedShapes() === Seq(8))
+
+    // A node is on its way: keep waiting past the downshift timeout.
+    podEvents = Seq(("NotTriggerScaleUp", "2026-11-16T00:00:00Z"),
+      ("TriggeredScaleUp", "2026-11-16T00:01:00Z"), ("Scheduled", "2026-11-16T00:02:00Z"))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(60000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods, never()).delete()
+
+    // No node will come: move down without waiting further.
+    podEvents = podEvents :+ (("NotTriggerScaleUp", "2026-11-16T00:03:00Z"))
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1")
+    assert(requestedShapes() === Seq(8, 4, 4))
+    podEvents = Seq.empty
+  }
+
+  test("SPARK-61258: any long-unschedulable pod moves the ladder down after the fallback") {
+    startShapeLadderAllocator("8,4,2",
+      KUBERNETES_EXECUTOR_SHAPE_CAPACITY_MISS_FALLBACK_TIMEOUT.key -> "30s")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1,
+      message = "0/3 nodes are available: pod group is not ready."), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods, never()).delete()
+    waitForExecutorPodsClock.advance(20000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1")
+    assert(requestedShapes() === Seq(8, 4, 4))
   }
 
   private def withShape(pod: Pod, cores: Int): Pod = {
