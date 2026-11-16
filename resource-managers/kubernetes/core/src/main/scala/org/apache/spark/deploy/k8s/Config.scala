@@ -657,8 +657,9 @@ private[spark] object Config extends Logging {
   val KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT =
     ConfigBuilder("spark.kubernetes.executor.shape.downshiftTimeout")
       .doc("How long an executor pod may stay unschedulable for lack of cpu or memory before " +
-        s"Spark replaces it with smaller executors from `${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}`." +
-        " Set it above the time the node autoscaler needs to add a node.")
+        "Spark replaces it with smaller executors from " +
+        s"`${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}`. " +
+        "Set it above the time the node autoscaler needs to add a node.")
       .version("4.4.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .checkValue(_ > 0, "The downshift timeout should be positive")
