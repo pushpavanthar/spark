@@ -98,7 +98,18 @@ private[spark] class BasicExecutorFeatureStep(
   // ResourceProfiles because we don't have a way of overriding them if needed
   private val executorCoresRequest =
     if (isDefaultProfile && kubernetesConf.sparkConf.contains(KUBERNETES_EXECUTOR_REQUEST_CORES)) {
-      kubernetesConf.get(KUBERNETES_EXECUTOR_REQUEST_CORES).get
+      val request = kubernetesConf.get(KUBERNETES_EXECUTOR_REQUEST_CORES).get
+      kubernetesConf.get(KUBERNETES_EXECUTOR_SHAPE_CORES) match {
+        // With a shape ladder the configured request is that of the reference shape and
+        // scales with the cores, so that a request below the cores (e.g. to fit the
+        // allocatable cpu of a node) stays below them at every size.
+        case Some(shapeCores) =>
+          val sizes = shapeCores / kubernetesConf.get(EXECUTOR_CORES)
+          val milliCores = new Quantity(request).getNumericalAmount
+            .multiply(java.math.BigDecimal.valueOf(1000L * sizes))
+          s"${milliCores.longValue}m"
+        case None => request
+      }
     } else {
       execResources.cores.get.toString
     }

@@ -88,10 +88,10 @@ private[spark] object ShapeLadder {
       if (conf.get(KUBERNETES_ALLOCATION_PODS_ALLOCATOR) != "direct") {
         reject(s"only ${KUBERNETES_ALLOCATION_PODS_ALLOCATOR.key}=direct supports it.")
       }
-      Seq(KUBERNETES_EXECUTOR_LIMIT_CORES.key, KUBERNETES_EXECUTOR_REQUEST_CORES.key)
-        .find(conf.contains).foreach { k =>
-          reject(s"$k is a per-executor absolute and cannot be combined with it.")
-        }
+      if (conf.contains(KUBERNETES_EXECUTOR_LIMIT_CORES)) {
+        reject(s"${KUBERNETES_EXECUTOR_LIMIT_CORES.key} is a per-executor absolute and cannot " +
+          "be combined with it.")
+      }
       conf.getAllWithPrefix("spark.executor.resource.").collectFirst {
         case (k, _) if k.endsWith(".amount") => s"spark.executor.resource.$k"
       }.foreach { k =>
