@@ -715,7 +715,9 @@ not move the ladder down until `spark.kubernetes.executor.shape.capacityMissFall
 passed. Later, once smaller pods have been placed and
 `spark.kubernetes.executor.shape.upshiftInterval` has passed, Spark sends a single pod of the next
 larger size as a probe. If the probe runs, that size is used again; if it does not fit, it is deleted
-and the wait before the next probe doubles.
+and the wait before the next probe doubles. A probe is only sent when the cores still missing cover the
+next larger size, and running executors are never replaced by larger ones: an application that is at
+its target, or loses less than one larger executor at a time, stays at the size it moved down to.
 
 A few settings adapt this to the cluster:
 
