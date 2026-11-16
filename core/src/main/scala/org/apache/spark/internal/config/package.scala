@@ -779,7 +779,7 @@ package object config {
         "(its registered cores / spark.executor.cores) executors when dynamic allocation " +
         "removes idle executors and when a kill adjusts the requested total. Set by cluster " +
         "managers that start executors of several sizes for one resource profile.")
-      .version("5.0.0")
+      .version("4.4.0")
       .booleanConf
       .createWithDefault(false)
 

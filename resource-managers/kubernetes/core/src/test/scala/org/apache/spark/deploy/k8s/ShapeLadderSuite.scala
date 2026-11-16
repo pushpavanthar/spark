@@ -106,8 +106,8 @@ class ShapeLadderSuite extends SparkFunSuite {
   test("per-executor absolutes cannot be combined with a ladder") {
     assertRejected(baseConf.set(KUBERNETES_EXECUTOR_LIMIT_CORES, "4"),
       KUBERNETES_EXECUTOR_LIMIT_CORES.key)
-    assertRejected(baseConf.set(KUBERNETES_EXECUTOR_REQUEST_CORES, "4"),
-      KUBERNETES_EXECUTOR_REQUEST_CORES.key)
+    // The cpu request of the reference shape scales with the cores.
+    assert(ShapeLadder.fromConf(baseConf.set(KUBERNETES_EXECUTOR_REQUEST_CORES, "3500m")).nonEmpty)
     assertRejected(baseConf.set("spark.executor.resource.gpu.amount", "1"),
       "spark.executor.resource.gpu.amount")
   }
