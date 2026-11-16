@@ -778,6 +778,20 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     assert(requestedShapes() === Seq(8, 8, 4, 4))
   }
 
+  test("SPARK-61258: a pending pod that has a node is never replaced by a downshift") {
+    startShapeLadderAllocator("8,4,2")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 8))
+    val starting = new PodBuilder(withShape(pendingExecutor(1), 8))
+      .editSpec().withNodeName("node-1").endSpec().build()
+    snapshotsStore.updatePod(starting)
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(2), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "2")
+    assert(requestedShapes() === Seq(8, 8, 4, 4))
+  }
+
   test("SPARK-61258: a pod of the smallest size stays pending") {
     startShapeLadderAllocator("4,2")
     podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
