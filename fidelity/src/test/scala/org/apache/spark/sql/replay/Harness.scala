@@ -10,7 +10,7 @@ import scala.io.Source
 
 import scala.collection.JavaConverters._
 
-import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
+import org.apache.spark.scheduler.SparkListenerEvent
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive._
@@ -148,13 +148,9 @@ object Harness {
     case o => o
   }
 
-  /** Collects the replay events the capture listener posts. */
-  class Collector extends SparkListener {
+  /** Collects the replay events capture produces. */
+  class Collector {
     val events = new java.util.concurrent.ConcurrentLinkedQueue[SparkListenerEvent]()
-    override def onOtherEvent(e: SparkListenerEvent): Unit = e match {
-      case _: SparkListenerSQLReplayPlan | _: SparkListenerSQLShuffleStageStats => events.add(e)
-      case _ =>
-    }
   }
 
   /**
@@ -167,8 +163,7 @@ object Harness {
     collector.events.clear()
     val df = spark.sql(sql)
     df.collect()
-    // First drain delivers the execution-end event to the capture listener, second its events.
-    bus.waitUntilEmpty(); bus.waitUntilEmpty()
+    bus.waitUntilEmpty()
     val events = collector.events.asScala.toSeq
       .map(e => JsonProtocol.sparkEventFromJson(JsonProtocol.sparkEventToJsonString(e)))
     val plan = events.collect { case p: SparkListenerSQLReplayPlan => p }.maxBy(_.executionId)
@@ -195,16 +190,17 @@ object Harness {
 
   /**
    * Really runs the workload with event logging: once to warm the JVM, then once under the job
-   * group. Returns the event log.
+   * group, at the harness base configuration plus `variant`. Returns the event log.
    */
-  def runWithEventLog(cores: Int, group: String, conf: Map[String, String] = Map()): String = {
+  def runWithEventLog(cores: Int, group: String, conf: Map[String, String] = Map(),
+      variant: Map[String, String] = Map()): String = {
     val logDir = Files.createTempDirectory(s"replay-log-$cores").toFile
     val spark = session(conf ++ Map("spark.eventLog.enabled" -> "true",
       "spark.eventLog.dir" -> logDir.toURI.toString), cores)
     spark.sparkContext.setLogLevel("ERROR")
     try {
       prepare(spark)
-      setConf(spark, Map())
+      setConf(spark, variant)
       def workload(): Unit = queries.foreach { case (_, sql) => spark.sql(sql).collect() }
       workload()
       spark.sparkContext.setJobGroup(group, "measured workload")
@@ -213,11 +209,10 @@ object Harness {
     logDir.listFiles().filter(f => f.isFile && f.getName.startsWith("local-")).head.getPath
   }
 
-  /** Registers capture the way an application would, plus a collector for its events. */
+  /** Captures every query of the session into a collector. */
   def attachCapture(spark: SparkSession): Collector = {
     val collector = new Collector
-    spark.sparkContext.addSparkListener(new ReplayCaptureListener)
-    spark.sparkContext.addSparkListener(collector)
+    spark.sparkContext.addSparkListener(new ReplayCapturer(e => collector.events.add(e)))
     collector
   }
 

@@ -21,6 +21,7 @@ Built for Spark 3.5.8 / Scala 2.12. One build per Spark version: the code uses `
     --conf spark.extraListeners=org.apache.spark.sql.replay.ReplayCaptureListener
 
 Capture never fails a query: anything unexpected is logged and that execution is skipped.
+It writes into the event log, so `spark.eventLog.enabled` must be on; without it nothing is captured.
 
 ## Tests
 
@@ -62,8 +63,17 @@ simulator reads. In local mode the driver is exported as the only executor.
 spark-submit --class org.apache.spark.sql.replay.AroTrace distiller.jar <event-log> <out-dir>
 ```
 
-Only the recorded run is exported. A trace rewritten for a config what-if (new partition counts
-from the plan replay) is not built.
+`WhatIfTrace.export(spark, eventLog, conf, outDir, name)` writes the same trace rewritten for a
+candidate SQL configuration. Every captured query is replayed under its recorded and under the
+candidate configuration; each stage whose shuffle read is cut differently gets the candidate's task
+count, and its recorded work is shared out by the bytes of each new partition (fetch wait grows with
+the task count as in the simulator's own cost model). The trace gains a `what_if` section with the
+flags raised and the stages re-cut.
+
+- Only repartitioning is exported. A candidate that changes a plan's shape (a join strategy, an
+  exchange) is refused.
+- The log must come from a run with capture enabled.
+- No per-task fixed cost is modelled: a candidate with many more, smaller tasks is predicted too fast.
 
 ## Flags
 

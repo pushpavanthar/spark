@@ -1,10 +1,14 @@
 package org.apache.spark.sql.replay
 
+import java.util.concurrent.atomic.AtomicBoolean
+
 import scala.util.control.NonFatal
 
-import org.apache.spark.{MapOutputTrackerMaster, SPARK_VERSION, SparkEnv}
+import org.apache.spark.{MapOutputTrackerMaster, SPARK_VERSION, SparkContext, SparkEnv,
+  SparkFirehoseListener}
 import org.apache.spark.internal.Logging
-import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent,
+  SparkListenerStageSubmitted}
 import org.apache.spark.sql.execution.{CommandResultExec, QueryExecution, SparkPlan}
 import org.apache.spark.sql.execution.adaptive._
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
@@ -20,7 +24,9 @@ object ReplayCapture {
     case o => o.children.flatMap(allNodes)
   })
 
-  def events(executionId: Long, qe: QueryExecution): Seq[SparkListenerEvent] = {
+  /** @param writerStage the stage that wrote a shuffle, by shuffle id */
+  def events(executionId: Long, qe: QueryExecution,
+      writerStage: Int => Option[Int]): Seq[SparkListenerEvent] = {
     val logical = SkeletonCodec.unwrapCommand(qe.optimizedPlan)
     val leafOf = logical.collectLeaves().zipWithIndex
       .flatMap { case (l, i) => l.output.map(_.exprId.id -> i) }.toMap
@@ -51,7 +57,7 @@ object ReplayCapture {
           e.outputPartitioning.numPartitions,
           bytes, stats.rowCount.map(clamp).getOrElse(-1L), clamp(stats.sizeInBytes),
           if (mapSizes.isDefined) parts else Array.empty, mapSizes.getOrElse(Array.empty),
-          truncated)
+          truncated, s.mapStats.flatMap(m => writerStage(m.shuffleId)).getOrElse(-1))
     }.groupBy(_.key).values.map(_.head).toSeq
 
     val broadcasts = nodes.collect {
@@ -73,19 +79,45 @@ object ReplayCapture {
 }
 
 /**
- * Writes the replay events for every SQL execution into the event log. Enable per application
- * with `spark.extraListeners=org.apache.spark.sql.replay.ReplayCaptureListener`.
+ * Builds the replay events of every SQL execution that ends and hands them to `emit`, on the
+ * listener thread it is registered on.
  */
-class ReplayCaptureListener extends SparkListener with Logging {
+class ReplayCapturer(emit: SparkListenerEvent => Unit) extends SparkListener with Logging {
+  // The event log does not say which stage wrote which shuffle; only the live stage does.
+  private val writerStage = scala.collection.concurrent.TrieMap[Int, Int]()
+
+  override def onStageSubmitted(e: SparkListenerStageSubmitted): Unit =
+    e.stageInfo.shuffleDepId.foreach(writerStage.putIfAbsent(_, e.stageInfo.stageId))
+
   override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
     case end: SparkListenerSQLExecutionEnd if end.qe != null =>
       // Capture must never fail or slow the application: anything unexpected is logged and dropped.
       try {
-        val bus = end.qe.sparkSession.sparkContext.listenerBus
-        ReplayCapture.events(end.executionId, end.qe).foreach(bus.post)
+        ReplayCapture.events(end.executionId, end.qe, writerStage.get).foreach(emit)
       } catch {
         case NonFatal(e) => logWarning(s"Replay capture skipped execution ${end.executionId}", e)
       }
     case _ =>
+  }
+}
+
+/**
+ * Writes the replay events of every SQL execution into the event log. Enable per application
+ * with `spark.extraListeners=org.apache.spark.sql.replay.ReplayCaptureListener`.
+ *
+ * An event a listener posts back to the bus is dropped once the application is stopping, and a
+ * batch job stops right after its last query. So on its first event this listener puts a
+ * [[ReplayCapturer]] on the event log's own queue, which is drained at stop, and that writes
+ * through the event logger on the logger's thread. Without event logging nothing is captured.
+ */
+class ReplayCaptureListener extends SparkFirehoseListener {
+  private val installed = new AtomicBoolean
+
+  override def onEvent(event: SparkListenerEvent): Unit = {
+    if (installed.compareAndSet(false, true)) {
+      for (sc <- SparkContext.getActive; logger <- sc.eventLogger) {
+        sc.listenerBus.addToEventLogQueue(new ReplayCapturer(logger.onOtherEvent))
+      }
+    }
   }
 }

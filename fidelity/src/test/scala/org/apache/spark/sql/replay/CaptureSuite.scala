@@ -23,8 +23,10 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
   private var collector: Harness.Collector = _
 
   override def beforeAll(): Unit = {
+    // Capture registered the way an application does it, writing into the event log.
     spark = Harness.session(Map("spark.eventLog.enabled" -> "true",
-      "spark.eventLog.dir" -> logDir.toURI.toString))
+      "spark.eventLog.dir" -> logDir.toURI.toString,
+      "spark.extraListeners" -> classOf[ReplayCaptureListener].getName))
     spark.sparkContext.setLogLevel("ERROR")
     Harness.prepare(spark)
     collector = Harness.attachCapture(spark)
@@ -141,7 +143,7 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
     }
     val end = SparkListenerSQLExecutionEnd(-1, 0L)
     end.qe = broken
-    new ReplayCaptureListener().onOtherEvent(end)
+    new ReplayCapturer(_ => ()).onOtherEvent(end)
   }
 
   test("the event log holds the events, replays cleanly, and capture stays cheap") {
@@ -150,7 +152,7 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
       val df = spark.sql(sql)
       df.collect()
       val t0 = System.nanoTime()
-      ReplayCapture.events(0, df.queryExecution)
+      ReplayCapture.events(0, df.queryExecution, _ => None)
       (System.nanoTime() - t0) / 1e6
     }
     spark.stop()
@@ -170,6 +172,9 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
     val in = Files.newInputStream(log.toPath)
     try bus.replay(in, log.getName) finally in.close()
     assert(seen.count(_.isInstanceOf[SparkListenerSQLReplayPlan]) >= Harness.queries.size)
+    // The application stopped right after its last query; that query must be captured too.
+    assert(seen.count(_.isInstanceOf[SparkListenerSQLReplayPlan]) ==
+      lines.count(_.contains("SparkListenerSQLExecutionEnd")))
 
     val total = lines.map(_.length.toLong).sum
     val added = ours.map(_.length.toLong).sum

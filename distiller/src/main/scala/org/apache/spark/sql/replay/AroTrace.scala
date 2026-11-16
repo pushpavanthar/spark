@@ -12,7 +12,7 @@ import com.fasterxml.jackson.module.scala.DefaultScalaModule
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.SparkConf
-import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerInterface, SparkListenerJobStart}
 import org.apache.spark.status.{AppStatusListener, AppStatusStore, ElementTrackingStore}
 import org.apache.spark.status.api.v1
 import org.apache.spark.util.kvstore.InMemoryStore
@@ -32,7 +32,11 @@ object AroTrace {
   def export(logPath: String, outDir: String,
       hadoopConf: Configuration = new Configuration()): String = {
     val trace = build(logPath, hadoopConf)
-    val dir = new File(outDir, trace("app").asInstanceOf[Map[String, Any]]("id").toString)
+    write(trace, new File(outDir, trace("app").asInstanceOf[Map[String, Any]]("id").toString))
+  }
+
+  /** Writes `dir/trace.json.gz`; the simulator loads a trace by the name of its directory. */
+  def write(trace: Map[String, Any], dir: File): String = {
     dir.mkdirs()
     val file = new File(dir, "trace.json.gz")
     val out = new GZIPOutputStream(new FileOutputStream(file))
@@ -41,7 +45,9 @@ object AroTrace {
     file.getPath
   }
 
-  def build(logPath: String, hadoopConf: Configuration = new Configuration()): Map[String, Any] = {
+  /** @param listeners also fed the event log, for callers that need more than the trace */
+  def build(logPath: String, hadoopConf: Configuration = new Configuration(),
+      listeners: Seq[SparkListenerInterface] = Nil): Map[String, Any] = {
     // A history replay trims the store to what the UI shows; a trace needs every task.
     val conf = new SparkConf(false)
     Seq("Jobs", "Stages", "Tasks", "DeadExecutors").foreach { what =>
@@ -54,7 +60,7 @@ object AroTrace {
         e.stageInfos.foreach(s => parents(s.stageId) = s.parentIds)
     }
     EventLogReader.replay(logPath, hadoopConf,
-      Seq(new AppStatusListener(kv, conf, live = false), parentListener))
+      Seq(new AppStatusListener(kv, conf, live = false), parentListener) ++ listeners)
     val store = new AppStatusStore(kv)
     try trace(store, parents.toMap) finally store.close()
   }

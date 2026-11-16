@@ -20,7 +20,7 @@ import org.apache.spark.sql.execution.exchange._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.storage.BlockManagerId
 
-case class Resolved(shuffleId: Int, numMappers: Int, bytes: Array[Long], dataSize: BigInt,
+case class Resolved(key: String, shuffleId: Int, numMappers: Int, bytes: Array[Long], dataSize: BigInt,
     rowCount: Option[BigInt])
 
 /** The replay events of one SQL execution. */
@@ -83,11 +83,11 @@ object Ctx {
       val id = nextShuffleId
       shuf.get(key) match {
         case Some(rec) if rec.bytesByPartitionId.isEmpty =>
-          Resolved(id, 0, null, BigInt(rec.dataSize), known(rec.rowCount))
+          Resolved(key, id, 0, null, BigInt(rec.dataSize), known(rec.rowCount))
         case Some(rec) if rec.numPartitions == n =>
           checkMapSizes(rec.bytesByPartitionId, rec.mapSizePartitions.toSet)
           register(id, mapSizes(rec))
-          Resolved(id, rec.numMappers, rec.bytesByPartitionId, BigInt(rec.dataSize),
+          Resolved(key, id, rec.numMappers, rec.bytesByPartitionId, BigInt(rec.dataSize),
             known(rec.rowCount))
         case Some(rec) if rec.numPartitions % n == 0 &&
             e.outputPartitioning.isInstanceOf[HashPartitioning] =>
@@ -99,21 +99,21 @@ object Ctx {
           flags += "FOLDED_PARTITIONS"
           checkMapSizes(fold(rec.bytesByPartitionId), rec.mapSizePartitions.map(_ % n).toSet)
           register(id, mapSizes(rec).map(fold))
-          Resolved(id, rec.numMappers, fold(rec.bytesByPartitionId), BigInt(rec.dataSize),
+          Resolved(key, id, rec.numMappers, fold(rec.bytesByPartitionId), BigInt(rec.dataSize),
             known(rec.rowCount))
         case Some(rec) =>
           flags += "EXTRAPOLATED_PARTITIONS"
           val bytes = Array.fill(n)(rec.bytesByPartitionId.sum / n)
           val mappers = math.max(rec.numMappers, 1)
           register(id, Array.fill(mappers)(bytes.map(_ / mappers)))
-          Resolved(id, rec.numMappers, bytes, BigInt(rec.dataSize), known(rec.rowCount))
+          Resolved(key, id, rec.numMappers, bytes, BigInt(rec.dataSize), known(rec.rowCount))
         case None =>
           // The run never shuffled this subplan (it broadcast it, say): no distribution exists.
           flags += "UNSEEN_SHUFFLE"
           val est = e.child.logicalLink.map(_.stats.sizeInBytes).getOrElse(BigInt(1))
           val bytes = Array.fill(n)((est / n).toLong)
           register(id, Array(bytes))
-          Resolved(id, 1, bytes, est, None)
+          Resolved(key, id, 1, bytes, est, None)
       }
     })
   }
@@ -154,6 +154,10 @@ object Ctx {
 
 case class FakeShuffleExchangeExec(delegate: ShuffleExchangeExec) extends ShuffleExchangeLike {
   @transient private lazy val rec = Ctx.shuffle(delegate)
+  /** Key of the recorded shuffle this exchange stands for, see [[Keys.shufKey]]. */
+  def recordedKey: String = rec.key
+  /** Bytes per reduce partition, at this exchange's partition count; null without map output. */
+  def bytesByPartitionId: Array[Long] = rec.bytes
   override def child: SparkPlan = delegate.child
   override def numMappers: Int = rec.numMappers
   // What the partitioner created, which a range partitioner may make smaller than requested.

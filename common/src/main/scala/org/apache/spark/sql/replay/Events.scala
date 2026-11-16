@@ -39,6 +39,8 @@ case class SparkListenerSQLReplayPlan(
  * @param mapSizePartitions / mapSizes for each listed reduce partition, the bytes written by every
  *        map task. Only skew candidates are listed, see [[Keys.mapSizePartitions]]
  * @param mapSizesTruncated true when more partitions qualified than were recorded
+ * @param writerStageId the scheduler stage that wrote the shuffle, which ties the plan to the
+ *        stages and tasks of the event log; -1 when unknown
  */
 case class SparkListenerSQLShuffleStageStats(
     executionId: Long,
@@ -50,4 +52,5 @@ case class SparkListenerSQLShuffleStageStats(
     dataSize: Long,
     mapSizePartitions: Array[Int],
     mapSizes: Array[Array[Long]],
-    mapSizesTruncated: Boolean) extends SparkListenerEvent
+    mapSizesTruncated: Boolean,
+    writerStageId: Int) extends SparkListenerEvent
