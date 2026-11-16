@@ -686,7 +686,7 @@ private[spark] object Config extends Logging {
       .doc("An executor pod that stays unschedulable for longer than this counts as not " +
         "fitting whatever the scheduler message says. This covers schedulers whose messages " +
         s"do not match `${KUBERNETES_EXECUTOR_SHAPE_CAPACITY_MISS_PATTERN.key}`.")
-      .version("5.0.0")
+      .version("4.4.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .checkValue(_ > 0, "The fallback timeout should be positive")
       .createWithDefaultString("10min")
@@ -696,7 +696,7 @@ private[spark] object Config extends Logging {
       .doc("How long Spark waits, after moving to a smaller executor size, before it probes " +
         "the next larger size again with a single pod. The interval doubles each time a " +
         s"probe fails, up to `spark.kubernetes.executor.shape.upshiftMaxInterval`.")
-      .version("5.0.0")
+      .version("4.4.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .checkValue(_ > 0, "The upshift interval should be positive")
       .createWithDefaultString("5min")
@@ -704,7 +704,7 @@ private[spark] object Config extends Logging {
   val KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_MAX_INTERVAL =
     ConfigBuilder("spark.kubernetes.executor.shape.upshiftMaxInterval")
       .doc(s"Upper bound of `${KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_INTERVAL.key}`.")
-      .version("5.0.0")
+      .version("4.4.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .checkValue(_ > 0, "The maximum upshift interval should be positive")
       .createWithDefaultString("1h")
@@ -714,9 +714,9 @@ private[spark] object Config extends Logging {
       .doc("PriorityClass of the pod that probes a larger executor size. With a class below " +
         "the cluster autoscaler's expendable pod cutoff a probe only finds capacity that " +
         "already exists and never causes a node to be added. A probe that is scheduled is " +
-        "deleted, if no executor has registered from it yet, and requested again without " +
-        "the class.")
-      .version("5.0.0")
+        "deleted and requested again without the class, so that no executor keeps running " +
+        "as a pod that may be preempted.")
+      .version("4.4.0")
       .stringConf
       .createOptional
 
@@ -726,7 +726,7 @@ private[spark] object Config extends Logging {
         "and `Nominated` mean a node is on its way and Spark keeps waiting; " +
         "`NotTriggerScaleUp` means none will come and Spark moves to a smaller size at once. " +
         "The driver needs permission to list events in its namespace.")
-      .version("5.0.0")
+      .version("4.4.0")
       .booleanConf
       .createWithDefault(false)
 
@@ -734,7 +734,7 @@ private[spark] object Config extends Logging {
     ConfigBuilder("spark.kubernetes.executor.shape.allowWastedSlots")
       .doc(s"Whether `${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}` may contain sizes that are not " +
         "a multiple of `spark.task.cpus`. Such an executor has cores no task can use.")
-      .version("5.0.0")
+      .version("4.4.0")
       .booleanConf
       .createWithDefault(false)
 

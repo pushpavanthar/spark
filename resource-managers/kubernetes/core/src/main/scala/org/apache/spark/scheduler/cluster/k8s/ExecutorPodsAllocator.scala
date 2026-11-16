@@ -172,7 +172,7 @@ class ExecutorPodsAllocator(
   private val unschedulableSince = mutable.HashMap.empty[Long, Long]
 
   // Executor ID -> (time its events were last read, reason of the latest autoscaler event).
-  private val autoscalerEvents = mutable.HashMap.empty[Long, (Long, Option[String])]
+  private val autoscalerEvents = mutable.HashMap.empty[Int, (Long, Option[String])]
 
   // The pod that is testing whether the size above the ceiling fits again, if any. A probe is
   // sent only after a pod was placed without trouble since the ceiling last moved down, and
@@ -635,7 +635,9 @@ class ExecutorPodsAllocator(
           probeBackoff = shapeUpshiftInterval
           nextProbeTime = currentTime + probeBackoff
           lastProbeSuccessTime = currentTime
-          if (shapeProbePriorityClass.isDefined && !schedulerKnownExecs.contains(id)) {
+          // Also when its executor has registered: an executor left under the probe class
+          // could be preempted, or lose its node to the autoscaler, at any time.
+          if (shapeProbePriorityClass.isDefined) {
             probeToReplace = Some(id)
           }
           probeExecutorId = None
@@ -654,12 +656,15 @@ class ExecutorPodsAllocator(
         id -> state
     }
     unschedulableSince.filterInPlace { case (id, _) => stuck.contains(id) }
-    autoscalerEvents.filterInPlace { case (id, _) => stuck.contains(id) }
+    // Pods of one size share their fate, so the events of the oldest one speak for the size.
+    val oldestStuck = stuck.groupBy { case (id, _) => pendingCores(id) }
+      .map { case (cores, ofSize) => cores -> ofSize.minBy(_._1)._2.pod }
+    autoscalerEvents.filterInPlace { case (cores, _) => oldestStuck.contains(cores) }
     val expired = stuck.collect { case (id, state) if {
         val age = currentTime - unschedulableSince.getOrElseUpdate(id, currentTime)
         val capacityMiss = shapeCapacityMissPattern.findFirstIn(state.message).nonEmpty
         age >= shapeFallbackTimeout || (capacityMiss &&
-          (latestAutoscalerEvent(id, state.pod, currentTime) match {
+          (latestAutoscalerEvent(pendingCores(id), oldestStuck, currentTime) match {
             case Some("NotTriggerScaleUp") => true
             case Some(_) => false
             case None => age >= shapeDownshiftTimeout
@@ -699,21 +704,25 @@ class ExecutorPodsAllocator(
   }
 
   /**
-   * Reason of the latest autoscaler event of an unschedulable pod: TriggeredScaleUp or
-   * Nominated when a node is on its way, NotTriggerScaleUp when none will come. None when
-   * events are not read or say nothing. Events are read at most every few seconds per pod.
+   * Reason of the latest autoscaler event of the oldest unschedulable pod of a size:
+   * TriggeredScaleUp or Nominated when a node is on its way, NotTriggerScaleUp when none will
+   * come. None when events are not read or say nothing. Events are read at most every few
+   * seconds per size, so the load on the API server does not grow with the pending pods.
    */
-  private def latestAutoscalerEvent(id: Long, pod: Pod, currentTime: Long): Option[String] = {
+  private def latestAutoscalerEvent(
+      cores: Int,
+      oldestStuck: Map[Int, Pod],
+      currentTime: Long): Option[String] = {
     if (!shapeReadAutoscalerEvents) {
       None
     } else {
-      autoscalerEvents.get(id) match {
+      autoscalerEvents.get(cores) match {
         case Some((readAt, reason)) if currentTime - readAt <
             ExecutorPodsAllocator.AUTOSCALER_EVENTS_REFRESH_MS =>
           reason
         case _ =>
           val reason = try {
-            readPodEvents(pod.getMetadata.getName)
+            readPodEvents(oldestStuck(cores).getMetadata.getName)
               .filter { case (reason, _) =>
                 ExecutorPodsAllocator.AUTOSCALER_EVENT_REASONS.contains(reason)
               }
@@ -726,7 +735,7 @@ class ExecutorPodsAllocator(
               shapeReadAutoscalerEvents = false
               None
           }
-          autoscalerEvents(id) = (currentTime, reason)
+          autoscalerEvents(cores) = (currentTime, reason)
           reason
       }
     }

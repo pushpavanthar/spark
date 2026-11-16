@@ -551,7 +551,10 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     waitForExecutorPodsClock.setTime(Instant.now.toEpochMilli)
     podsAllocatorUnderTest = new ExecutorPodsAllocator(ladderConf, secMgr, executorBuilder,
         kubernetesClient, snapshotsStore, waitForExecutorPodsClock) {
-      override protected def readPodEvents(podName: String): Seq[(String, String)] = podEvents
+      override protected def readPodEvents(podName: String): Seq[(String, String)] = {
+        podEventReads += podName
+        podEvents
+      }
     }
     podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
@@ -559,6 +562,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
   // (reason, last timestamp) of the events the allocator reads for any pod.
   private var podEvents = Seq.empty[(String, String)]
+  private val podEventReads = mutable.ArrayBuffer.empty[String]
 
   // Ladder 8,4,2 with executors 1 (8 cores, deleted) and 2, 3 (4 cores, running): the 8-core
   // size did not fit, the ceiling is at 4 cores and pods have been placed since.
@@ -667,6 +671,42 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     assert(podsAllocatorUnderTest.isDeleted("4"))
     assert(requestedShapes().last === 8)
     assert(priorityClasses().last === null)
+  }
+
+  test("SPARK-61258: a probe is replaced even when its executor has registered") {
+    shapeLadderTarget = 4
+    startShapeLadderAllocatorAtFourCores(
+      KUBERNETES_EXECUTOR_SHAPE_PROBE_PRIORITY_CLASS.key -> "spark-probe")
+    waitForExecutorPodsClock.advance(60000)
+    assert(requestEightMoreCores() === Seq(8))
+
+    // An executor left under the probe class could be preempted at any time.
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq("2", "3", "4"))
+    snapshotsStore.updatePod(withShape(runningExecutor(4), 8))
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "4")
+    assert(podsAllocatorUnderTest.isDeleted("4"))
+    assert(requestedShapes().last === 8)
+  }
+
+  test("SPARK-61258: autoscaler events are read once per size, not once per pod") {
+    podEventReads.clear()
+    podEvents = Seq(("TriggeredScaleUp", "2026-11-16T00:01:00Z"))
+    startShapeLadderAllocator("8,4,2",
+      KUBERNETES_EXECUTOR_SHAPE_READ_AUTOSCALER_EVENTS.key -> "true",
+      KUBERNETES_EXECUTOR_SHAPE_CAPACITY_MISS_FALLBACK_TIMEOUT.key -> "5min")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 12))
+    assert(requestedShapes() === Seq(8, 8, 8))
+    (1 to 3).foreach(id => snapshotsStore.updatePod(withShape(unschedulableExecutor(id), 8)))
+    snapshotsStore.notifySubscribers()
+    snapshotsStore.notifySubscribers()
+    // The oldest pod speaks for the size, and its events are kept for a few seconds.
+    assert(podEventReads.toSeq === Seq(unschedulableExecutor(1).getMetadata.getName))
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    assert(podEventReads.size === 2)
+    verify(labeledPods, never()).delete()
+    podEvents = Seq.empty
   }
 
   test("SPARK-61258: autoscaler events shorten or extend the wait for a size") {
