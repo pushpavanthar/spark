@@ -695,8 +695,8 @@ ladder must be a multiple of the reference cores, and an executor of 16 cores ge
 off-heap and PySpark memory of the reference shape. Memory overhead is computed from
 `spark.executor.memoryOverheadFactor` at each size; an explicit `spark.executor.memoryOverhead` is
 the overhead of the reference shape and scales the same way. A size at which the factor would give
-less than `spark.executor.minMemoryOverhead` is rejected when the application starts, because the
-floor would break the fixed memory per core.
+less than `spark.executor.minMemoryOverhead` gets that minimum, as an executor of that size would
+without a ladder, so a small size may carry a little more overhead per core than a large one.
 
 Tasks are scheduled as before: `spark.task.cpus` and the memory behind each core are the same on every
 executor, and a larger executor only runs more tasks at once. `spark.executor.instances`, the
