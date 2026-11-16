@@ -582,7 +582,9 @@ class ExecutorPodsAllocator(
       }
     }
     val tooLarge = if (expired.nonEmpty) {
-      pendingCores.collect { case (id, cores) if cores > shapeCeilingCores => id }.toSet
+      // A pod that already has a node only waits for its containers to start; it stays.
+      pendingCores.collect { case (id, cores) if cores > shapeCeilingCores &&
+        pods(id).pod.getSpec.getNodeName == null => id }.toSet
     } else {
       Set.empty[Long]
     }
