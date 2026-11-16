@@ -553,6 +553,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
         kubernetesClient, snapshotsStore, waitForExecutorPodsClock) {
       override protected def readPodEvents(podName: String): Seq[(String, String)] = {
         podEventReads += podName
+        podEventsError.foreach(e => throw e)
         podEvents
       }
     }
@@ -563,6 +564,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
   // (reason, last timestamp) of the events the allocator reads for any pod.
   private var podEvents = Seq.empty[(String, String)]
   private val podEventReads = mutable.ArrayBuffer.empty[String]
+  private var podEventsError = Option.empty[KubernetesClientException]
 
   // Ladder 8,4,2 with executors 1 (8 cores, deleted) and 2, 3 (4 cores, running): the 8-core
   // size did not fit, the ceiling is at 4 cores and pods have been placed since.
@@ -732,6 +734,69 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1")
     assert(requestedShapes() === Seq(8, 4, 4))
     podEvents = Seq.empty
+  }
+
+  test("SPARK-61258: without permission to list events the timeouts apply") {
+    podEventReads.clear()
+    podEventsError = Some(new KubernetesClientException("events is forbidden"))
+    try {
+      startShapeLadderAllocator("8,4,2",
+        KUBERNETES_EXECUTOR_SHAPE_READ_AUTOSCALER_EVENTS.key -> "true")
+      podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+      snapshotsStore.updatePod(withShape(unschedulableExecutor(1), 8))
+      snapshotsStore.notifySubscribers()
+      snapshotsStore.notifySubscribers()
+      verify(labeledPods, never()).delete()
+      waitForExecutorPodsClock.advance(10000)
+      snapshotsStore.notifySubscribers()
+      verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1")
+      assert(requestedShapes() === Seq(8, 4, 4))
+      // Reading was given up after the first failure.
+      assert(podEventReads.size === 1)
+    } finally {
+      podEventsError = None
+    }
+  }
+
+  test("SPARK-61258: the wait between probes is capped by upshiftMaxInterval") {
+    shapeLadderTarget = 4
+    startShapeLadderAllocatorAtFourCores(
+      KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_MAX_INTERVAL.key -> "90s")
+    waitForExecutorPodsClock.advance(60000)
+    assert(requestEightMoreCores() === Seq(8))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(4), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    snapshotsStore.updatePod(withShape(runningExecutor(5), 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(6), 4))
+    snapshotsStore.notifySubscribers()
+
+    // Doubling 60s would give 120s; the cap makes it 90s.
+    waitForExecutorPodsClock.advance(60000)
+    assert(requestEightMoreCores() === Seq(4, 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(7), 4))
+    snapshotsStore.updatePod(withShape(runningExecutor(8), 4))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(30000)
+    assert(requestEightMoreCores() === Seq(8))
+  }
+
+  test("SPARK-61258: no probe while nothing has been placed since the downshift") {
+    shapeLadderTarget = 4
+    startShapeLadderAllocator("8,4,2", KUBERNETES_EXECUTOR_SHAPE_UPSHIFT_INTERVAL.key -> "60s")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    assert(requestedShapes() === Seq(8, 4, 4))
+    // The smaller pods are still pending: nothing shows that there is room at all.
+    snapshotsStore.updatePod(withShape(pendingExecutor(2), 4))
+    snapshotsStore.updatePod(withShape(pendingExecutor(3), 4))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(300000)
+    assert(requestEightMoreCores() === Seq(4, 4))
   }
 
   test("SPARK-61258: any long-unschedulable pod moves the ladder down after the fallback") {
