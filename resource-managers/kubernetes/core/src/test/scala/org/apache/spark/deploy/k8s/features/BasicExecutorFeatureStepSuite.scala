@@ -925,6 +925,16 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     baseConf.set(EXECUTOR_MEMORY_OVERHEAD.key, "500m")
     initDefaultProfile(baseConf)
     assert(amountAndFormat(build(Some(8))._2("memory")) === s"${16384 + 2000 + 4096}Mi")
+
+    // So does a cpu request: 1.75 of 2 cores at the reference shape is 7 of 8 cores.
+    Seq("1750m", "1.75").foreach { request =>
+      baseConf.set(KUBERNETES_EXECUTOR_REQUEST_CORES, request)
+      assert(build(Some(2))._2("cpu").getNumericalAmount.doubleValue === 1.75)
+      val (scaledEnv, scaledRequests) = build(Some(8))
+      assert(scaledRequests("cpu").getNumericalAmount.doubleValue === 7.0)
+      assert(scaledEnv(ENV_EXECUTOR_CORES) === "8")
+    }
+    baseConf.remove(KUBERNETES_EXECUTOR_REQUEST_CORES)
   }
 
   test("SPARK-55639: ENV_EXECUTOR_CORES is spark.task.cpus when recoveryMode is enabled") {

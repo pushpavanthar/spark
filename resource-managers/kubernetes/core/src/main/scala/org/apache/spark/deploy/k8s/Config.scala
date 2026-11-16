@@ -647,7 +647,7 @@ private[spark] object Config extends Logging {
         "of the reference shape. Spark requests the largest size first and moves to smaller " +
         "sizes when Kubernetes reports that a pod cannot be scheduled for lack of cpu or " +
         "memory. Requires the `direct` pods allocator.")
-      .version("5.0.0")
+      .version("4.4.0")
       .intConf
       .toSequence
       .checkValue(l => l.nonEmpty && l.forall(_ > 0),
@@ -657,17 +657,19 @@ private[spark] object Config extends Logging {
   val KUBERNETES_EXECUTOR_SHAPE_DOWNSHIFT_TIMEOUT =
     ConfigBuilder("spark.kubernetes.executor.shape.downshiftTimeout")
       .doc("How long an executor pod may stay unschedulable for lack of cpu or memory before " +
-        s"Spark replaces it with smaller executors from `${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}`.")
-      .version("5.0.0")
+        "Spark replaces it with smaller executors from " +
+        s"`${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}`. " +
+        "Set it above the time the node autoscaler needs to add a node.")
+      .version("4.4.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .checkValue(_ > 0, "The downshift timeout should be positive")
-      .createWithDefaultString("60s")
+      .createWithDefaultString("120s")
 
   val KUBERNETES_EXECUTOR_SHAPE_INITIAL_CORES =
     ConfigBuilder("spark.kubernetes.executor.shape.initialCores")
       .doc(s"The size in `${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}` to start from. Defaults to " +
         "the largest size.")
-      .version("5.0.0")
+      .version("4.4.0")
       .intConf
       .createOptional
 
@@ -675,7 +677,7 @@ private[spark] object Config extends Logging {
     ConfigBuilder("spark.kubernetes.executor.shape.capacityMissPattern")
       .doc("Regular expression matched against the scheduler message of an unschedulable " +
         "executor pod. Only a matching pod can trigger a move to a smaller executor size.")
-      .version("5.0.0")
+      .version("4.4.0")
       .stringConf
       .createWithDefault("Insufficient (cpu|memory)")
 
@@ -741,7 +743,7 @@ private[spark] object Config extends Logging {
       .internal()
       .doc("Cores of the executor pod being built. Set per pod by the pods allocator when " +
         s"`${KUBERNETES_EXECUTOR_SHAPE_LADDER.key}` is configured.")
-      .version("5.0.0")
+      .version("4.4.0")
       .intConf
       .createOptional
 
