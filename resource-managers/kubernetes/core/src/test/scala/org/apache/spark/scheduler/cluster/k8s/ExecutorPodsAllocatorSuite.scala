@@ -637,6 +637,27 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     assert(requestedShapes() === Seq(8, 8, 4, 4))
   }
 
+  test("SPARK-61258: a failed delete of the larger pods is tried again") {
+    startShapeLadderAllocator("8,4,2")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    when(labeledPods.delete()).thenThrow(new KubernetesClientException("Simulated failure"))
+      .thenReturn(new java.util.ArrayList[StatusDetails]())
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    // The pod is still there and still counts, so nothing is requested on top of it.
+    snapshotsStore.notifySubscribers()
+    assert(!podsAllocatorUnderTest.isDeleted("1"))
+    assert(requestedShapes() === Seq(8))
+
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods, times(2)).delete()
+    assert(podsAllocatorUnderTest.isDeleted("1"))
+    assert(requestedShapes() === Seq(8, 4, 4))
+  }
+
   test("SPARK-61258: a pod of the smallest size stays pending") {
     startShapeLadderAllocator("4,2")
     podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
