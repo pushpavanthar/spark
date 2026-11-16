@@ -355,7 +355,6 @@ class ExecutorPodsAllocator(
         }
       }
       if (tooLarge.nonEmpty) {
-        _deletedExecutorIds = _deletedExecutorIds ++ tooLarge
         Utils.tryLogNonFatalError {
           kubernetesClient
             .pods()
@@ -365,6 +364,9 @@ class ExecutorPodsAllocator(
             .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
             .withLabelIn(SPARK_EXECUTOR_ID_LABEL, tooLarge.toSeq.sorted.map(_.toString): _*)
             .delete()
+          // Only once the delete went through: after a failed call the pods are still pending
+          // and have to count, and to time out again, or they would be left behind for good.
+          _deletedExecutorIds = _deletedExecutorIds ++ tooLarge
         }
       }
     }
