@@ -120,16 +120,16 @@ class ShapeLadderSuite extends SparkFunSuite {
       "org.apache.spark.deploy.k8s.features.VolcanoFeatureStep"), "gang scheduling")
   }
 
-  test("a size that would need the overhead floor is rejected") {
-    // 1g per core: 0.1 x heap reaches the 384m floor at 4 cores.
-    val conf = baseConf.set(EXECUTOR_MEMORY.key, "4g")
-      .set(KUBERNETES_EXECUTOR_SHAPE_LADDER.key, "8,4")
-    assert(ShapeLadder.fromConf(conf).nonEmpty)
-    val tooSmall = conf.set(EXECUTOR_CORES, 2).set(EXECUTOR_MEMORY.key, "2g")
+  test("a size below the overhead floor gets the floor") {
+    // 1g per core: 0.1 x heap is below the 384m floor at 2 cores.
+    val conf = baseConf.set(EXECUTOR_CORES, 2).set(EXECUTOR_MEMORY.key, "2g")
       .set(KUBERNETES_EXECUTOR_SHAPE_LADDER.key, "8,4,2")
-    assertRejected(tooSmall, "The smallest size this ratio allows is 4 cores")
-    // An explicit overhead scales with the cores and has no floor to respect.
-    assert(ShapeLadder.fromConf(tooSmall.set(EXECUTOR_MEMORY_OVERHEAD.key, "300m")).nonEmpty)
+    assert(ShapeLadder.fromConf(conf).nonEmpty)
+    val reference = ExecutorResourcesOrDefaults(Some(2), 2048, 0, 0, 384, 2432, Map.empty)
+    assert(ShapeLadder.resourcesFor(reference, 2, conf) === reference)
+    val r = ShapeLadder.resourcesFor(reference, 8, conf)
+    assert(r.memoryOverheadMiB === 819)
+    assert(r.totalMemMiB === 8192 + 819)
   }
 
   test("resources scale with the cores") {
