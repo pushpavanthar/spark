@@ -937,6 +937,19 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     baseConf.remove(KUBERNETES_EXECUTOR_REQUEST_CORES)
   }
 
+  test("SPARK-61258: a shape ladder size does not apply to a non-default resource profile") {
+    baseConf.set(KUBERNETES_EXECUTOR_SHAPE_CORES, 8)
+    val rpb = new ResourceProfileBuilder()
+    rpb.require(new ExecutorResourceRequests().cores(4).memory("2g"))
+    val step = new BasicExecutorFeatureStep(newExecutorConf(), rpb.build())
+    val container = step.configurePod(SparkPod.initialPod()).container
+    val env = container.getEnv.asScala.map(e => e.getName -> e.getValue).toMap
+    assert(env(ENV_EXECUTOR_CORES) === "4")
+    assert(env(ENV_EXECUTOR_MEMORY) === "2048m")
+    assert(amountAndFormat(container.getResources.getRequests.get("cpu")) === "4")
+    baseConf.remove(KUBERNETES_EXECUTOR_SHAPE_CORES)
+  }
+
   test("SPARK-55639: ENV_EXECUTOR_CORES is spark.task.cpus when recoveryMode is enabled") {
     val rpb = new ResourceProfileBuilder()
     val ereq = new ExecutorResourceRequests()

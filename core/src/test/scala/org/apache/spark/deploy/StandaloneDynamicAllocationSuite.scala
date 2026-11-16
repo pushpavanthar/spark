@@ -378,6 +378,22 @@ class StandaloneDynamicAllocationSuite
     assert(apps.head.getExecutorLimit === 1)
   }
 
+  test("SPARK-61258: a kill lowers the target by the executor's units with unit weighting") {
+    // No spark.executor.cores: each executor takes the 10 cores of its worker and is worth 10
+    // executors of the default 1 core.
+    sc = new SparkContext(appConf.set(config.EXECUTOR_UNIT_WEIGHTING_ENABLED, true))
+    sc.requestTotalExecutors(12, 0, Map.empty)
+    eventually(timeout(10.seconds), interval(10.millis)) {
+      val apps = getApplications()
+      assert(apps.head.executors.size === 2)
+      assert(apps.head.getExecutorLimit === 12)
+    }
+    syncExecutors(sc)
+    val executors = getExecutorIds(sc)
+    assert(sc.killExecutor(executors.head))
+    assert(getApplications().head.getExecutorLimit === 2)
+  }
+
   test("the pending replacement executors should not be lost (SPARK-10515)") {
     sc = new SparkContext(appConf)
     val appId = sc.applicationId

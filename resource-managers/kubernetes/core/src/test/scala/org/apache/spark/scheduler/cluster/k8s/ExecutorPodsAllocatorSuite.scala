@@ -857,6 +857,19 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     assert(requestedShapes() === Seq(8))
   }
 
+  test("SPARK-61258: capacityMissPattern decides which messages are a capacity miss") {
+    startShapeLadderAllocator("8,4,2",
+      KUBERNETES_EXECUTOR_SHAPE_CAPACITY_MISS_PATTERN.key -> "didn't match Pod's node")
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 4))
+    snapshotsStore.updatePod(withShape(unschedulableExecutor(1, message = "0/3 nodes are " +
+      "available: 3 node(s) didn't match Pod's node affinity/selector."), 8))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(10000)
+    snapshotsStore.notifySubscribers()
+    verify(labeledPods).withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1")
+    assert(requestedShapes() === Seq(8, 4, 4))
+  }
+
   test("SPARK-61258: excess pending pods are released in cores under a shape ladder") {
     startShapeLadderAllocator("8,4,2")
     podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 6))
