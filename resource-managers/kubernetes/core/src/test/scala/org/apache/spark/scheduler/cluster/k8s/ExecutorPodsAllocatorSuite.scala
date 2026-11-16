@@ -540,8 +540,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     verify(podResource, times(1)).create()
   }
 
-  // Reference shape of 2 cores and 8g, so that every size of the ladder clears the overhead
-  // floor. One expected executor is worth 2 cores.
+  // Reference shape of 2 cores and 8g. One expected executor is worth 2 cores.
   private def startShapeLadderAllocator(ladder: String, extraConf: (String, String)*): Unit = {
     val ladderConf = conf.clone()
       .set(EXECUTOR_CORES, 2)

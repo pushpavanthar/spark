@@ -25,7 +25,7 @@ import org.apache.spark.resource.ResourceProfile.ExecutorResourcesOrDefaults
 
 /**
  * The executor sizes, in cores, that executors of the default resource profile may take
- * (SPARK-61258). Memory per core is the same at every size.
+ * (SPARK-61258). Heap, off-heap and PySpark memory per core are the same at every size.
  *
  * @param rungs sizes in cores, largest first
  * @param referenceCores `spark.executor.cores`; one requested executor is worth this many cores
@@ -104,19 +104,6 @@ private[spark] object ShapeLadder {
             .exists(_.endsWith("VolcanoFeatureStep"))) {
         reject("gang scheduling (Volcano, YuniKorn) sizes its pod group for one executor size.")
       }
-
-      if (!conf.contains(EXECUTOR_MEMORY_OVERHEAD)) {
-        val heapPerCoreMiB = conf.get(EXECUTOR_MEMORY).toDouble / referenceCores
-        val minOverheadMiB = conf.get(EXECUTOR_MIN_MEMORY_OVERHEAD)
-        val factor = overheadFactor(conf)
-        rungs.find(r => (factor * heapPerCoreMiB * r).toLong < minOverheadMiB).foreach { r =>
-          val minCores = math.ceil(minOverheadMiB / (factor * heapPerCoreMiB)).toInt
-          reject(s"size $r would get the ${EXECUTOR_MIN_MEMORY_OVERHEAD.key}=${minOverheadMiB}m " +
-            f"floor instead of $factor%.2f x heap, which breaks the fixed memory per core " +
-            f"(${heapPerCoreMiB}%.0f MiB heap per core). The smallest size this ratio allows is " +
-            s"$minCores cores; remove the smaller sizes or set ${EXECUTOR_MEMORY_OVERHEAD.key}.")
-        }
-      }
       ShapeLadder(rungs, referenceCores)
     }
   }
@@ -133,7 +120,8 @@ private[spark] object ShapeLadder {
    * Resources of an executor of `cores` cores, given the resources of the reference shape.
    * Heap, off-heap and PySpark memory scale with the cores. An explicitly configured overhead
    * is the reference shape's overhead and scales too; otherwise it is recomputed from the
-   * factor and the floor.
+   * factor and the floor, as for an executor of that size without a ladder. A small size may
+   * so carry a little more overhead per core than a large one.
    */
   def resourcesFor(
       reference: ExecutorResourcesOrDefaults,
