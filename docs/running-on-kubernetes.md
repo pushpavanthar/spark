@@ -730,14 +730,17 @@ A few settings adapt this to the cluster:
 * With the Kubernetes cluster autoscaler, set
   `spark.kubernetes.executor.shape.probe.priorityClassName` to a PriorityClass below the autoscaler's
   expendable pod cutoff. A probe then only finds room that already exists and never causes a node to
-  be added. A probe that is scheduled is replaced by a pod without the class, unless its executor has
-  already registered.
+  be added. A probe that is scheduled is replaced by a pod without the class, also when its executor
+  has already registered, so that no executor keeps running as a pod that may be preempted.
 
 A shape ladder applies to the default resource profile and requires the `direct` pods allocator. It
-cannot be combined with `spark.kubernetes.executor.limit.cores`,
-`spark.kubernetes.executor.request.cores`, executor custom resources
+cannot be combined with `spark.kubernetes.executor.limit.cores`, executor custom resources
 (`spark.executor.resource.*.amount`), or with Volcano or YuniKorn gang scheduling; Spark fails at
-startup with a message that names the conflicting setting. Each executor pod carries its size in the
+startup with a message that names the conflicting setting.
+`spark.kubernetes.executor.request.cores` is the cpu request of the reference shape and scales with
+the size: with `spark.executor.cores=4` and a request of `3500m`, a 16-core executor requests
+`14000m`. Use it when a pod that requests all the cpus of a node would not fit the node's allocatable
+cpu. Each executor pod carries its size in the
 `spark-exec-shape-cores` label. While recovery mode is on, new executors take the smallest size. Larger
 executors lose more tasks when a spot node is reclaimed, so consider `spark.decommission.enabled` with
 a ladder on spot capacity. The current size and the number of moves are available as metrics, see
@@ -1084,7 +1087,7 @@ See the [configuration page](configuration.html) for information on Spark config
     the largest size first and moves to smaller sizes when Kubernetes cannot schedule a pod for lack
     of cpu or memory. See <a href="#executor-shape-ladder">Executor Shape Ladder</a>.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.initialCores</code></td>
@@ -1093,17 +1096,18 @@ See the [configuration page](configuration.html) for information on Spark config
     The size of <code>spark.kubernetes.executor.shape.ladder</code> to start from. Defaults to the
     largest size.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.downshiftTimeout</code></td>
-  <td><code>60s</code></td>
+  <td><code>120s</code></td>
   <td>
     How long an executor pod may stay unschedulable for lack of cpu or memory before Spark replaces
-    the pending pods of its size with smaller executors. Must be shorter than
+    the pending pods of its size with smaller executors. Set it above the time the node autoscaler
+    needs to add a node. Must be shorter than
     <code>spark.kubernetes.allocation.executor.timeout</code>.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.capacityMissPattern</code></td>
@@ -1112,7 +1116,7 @@ See the [configuration page](configuration.html) for information on Spark config
     Regular expression matched against the scheduler message of an unschedulable executor pod to
     decide that it is waiting for capacity and not for something else, such as a toleration.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.capacityMissFallbackTimeout</code></td>
@@ -1121,7 +1125,7 @@ See the [configuration page](configuration.html) for information on Spark config
     An executor pod that stays unschedulable for longer than this counts as not fitting, whatever
     the scheduler message says.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.upshiftInterval</code></td>
@@ -1131,7 +1135,7 @@ See the [configuration page](configuration.html) for information on Spark config
     size with a single pod. Doubles each time a probe fails, up to
     <code>spark.kubernetes.executor.shape.upshiftMaxInterval</code>.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.upshiftMaxInterval</code></td>
@@ -1139,16 +1143,16 @@ See the [configuration page](configuration.html) for information on Spark config
   <td>
     Upper bound of <code>spark.kubernetes.executor.shape.upshiftInterval</code>.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.probe.priorityClassName</code></td>
   <td><code>(none)</code></td>
   <td>
     PriorityClass of the pod that probes a larger executor size. A probe that is scheduled is replaced
-    by a pod without the class, unless its executor has already registered.
+    by a pod without the class, so that no executor keeps running as a pod that may be preempted.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.readAutoscalerEvents</code></td>
@@ -1158,7 +1162,7 @@ See the [configuration page](configuration.html) for information on Spark config
     <code>Nominated</code> extend the wait for its size, <code>NotTriggerScaleUp</code> ends it.
     Requires permission to list events in the driver's namespace.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.executor.shape.allowWastedSlots</code></td>
@@ -1167,7 +1171,7 @@ See the [configuration page](configuration.html) for information on Spark config
     Whether the ladder may contain sizes that are not a multiple of <code>spark.task.cpus</code>.
     Such an executor has cores no task can use.
   </td>
-  <td>5.0.0</td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.kubernetes.jars.avoidDownloadSchemes</code></td>
