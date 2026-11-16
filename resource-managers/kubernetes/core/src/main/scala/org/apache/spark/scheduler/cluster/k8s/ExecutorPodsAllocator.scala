@@ -343,7 +343,6 @@ class ExecutorPodsAllocator(
       probeToReplace.foreach { id =>
         logInfo(log"Replacing probe executor ${MDC(LogKeys.EXECUTOR_ID, id)}: it showed that " +
           log"the size fits and gives way to a pod without the probe PriorityClass.")
-        _deletedExecutorIds = _deletedExecutorIds + id
         Utils.tryLogNonFatalError {
           kubernetesClient
             .pods()
@@ -352,6 +351,8 @@ class ExecutorPodsAllocator(
             .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
             .withLabelIn(SPARK_EXECUTOR_ID_LABEL, id.toString)
             .delete()
+          // Only once the delete went through, so that a probe that is still there counts.
+          _deletedExecutorIds = _deletedExecutorIds + id
         }
       }
       if (tooLarge.nonEmpty) {
