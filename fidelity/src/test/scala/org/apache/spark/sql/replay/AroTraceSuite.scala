@@ -46,4 +46,14 @@ class AroTraceSuite extends AnyFunSuite {
       assert(parents.nonEmpty && parents.forall(wrote.contains), s"stage ${s.get("stage_id")}")
     }
   }
+
+  test("a compacted event log is refused") {
+    val dir = java.nio.file.Files.createTempDirectory("replay-compact").toFile
+    val app = new File(dir, "eventlog_v2_app-1")
+    app.mkdir()
+    new File(app, "appstatus_app-1").createNewFile()
+    new File(app, "events_1_app-1.compact").createNewFile()
+    val e = intercept[IllegalArgumentException](EventLogReader.read(app.getPath))
+    assert(e.getMessage.contains("compacted"))
+  }
 }

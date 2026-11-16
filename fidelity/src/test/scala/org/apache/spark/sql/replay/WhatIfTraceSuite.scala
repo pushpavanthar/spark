@@ -1,6 +1,9 @@
 package org.apache.spark.sql.replay
 
 import java.io.File
+import java.nio.file.Files
+
+import scala.collection.JavaConverters._
 
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -62,5 +65,20 @@ class WhatIfTraceSuite extends AnyFunSuite {
       WhatIfTrace.build(spark, baseline, Map("spark.sql.autoBroadcastJoinThreshold" -> "-1"))
     } finally spark.stop()
     assert(e.getMessage.contains("changes shape"))
+  }
+
+  test("a query without a captured plan is flagged: its stages stay as recorded") {
+    val log = new File(baseline)
+    val lines = Files.readAllLines(log.toPath).asScala
+    val dropped = lines.lastIndexWhere(_.contains("SparkListenerSQLReplayPlan"))
+    val copy = new File(Files.createTempDirectory("replay-uncaptured").toFile, log.getName)
+    Files.write(copy.toPath, lines.patch(dropped, Nil, 1).asJava)
+    val spark = Harness.session()
+    val whatIf = try {
+      WhatIfTrace.build(spark, copy.getPath,
+        Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "1m"))
+    } finally spark.stop()
+    val flags = whatIf("what_if").asInstanceOf[Obj]("flags").asInstanceOf[Seq[String]]
+    assert(flags.contains("UNCAPTURED_EXECUTION"))
   }
 }

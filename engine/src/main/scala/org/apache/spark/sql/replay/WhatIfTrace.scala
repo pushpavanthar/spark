@@ -158,6 +158,10 @@ object WhatIfTrace {
       s("parents_inferred").asInstanceOf[Seq[Int]].map(p => sameAs.getOrElse(p, p)).toSet
 
     val flags = mutable.LinkedHashSet[String]()
+    // A query whose capture failed keeps its recorded stages, whatever the candidate changes.
+    if ((captured.sessionConf.keySet -- captured.plans.map(_.executionId)).nonEmpty) {
+      flags += "UNCAPTURED_EXECUTION"
+    }
     val recuts = mutable.Buffer[Obj]()
     captured.plans.sortBy(_.executionId).foreach { plan =>
       val id = plan.executionId

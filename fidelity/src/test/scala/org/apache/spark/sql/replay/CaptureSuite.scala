@@ -9,10 +9,14 @@ import scala.io.Source
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
-import org.apache.spark.scheduler.{ReplayListenerBus, SparkListener, SparkListenerEvent}
+import org.apache.spark.{MapOutputTrackerMaster, SparkContext, SparkEnv}
+import org.apache.spark.scheduler.{ReplayListenerBus, SparkListener, SparkListenerApplicationEnd,
+  SparkListenerEvent}
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.execution.QueryExecution
+import org.apache.spark.sql.catalyst.plans.logical.{GlobalLimit, LogicalPlan}
+import org.apache.spark.sql.execution.{FilterExec, QueryExecution, SparkPlan}
+import org.apache.spark.sql.execution.adaptive.QueryStageExec
+import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 import org.apache.spark.util.JsonProtocol
 
@@ -136,6 +140,57 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
     }
   }
 
+  test("a decimal literal survives the round trip whatever its precision") {
+    val plan = spark.sql("""select sum(cast(price as decimal(10, 2)) * 0.05) from sales
+      where cast(price as decimal(10, 2)) > 0.07""").queryExecution.optimizedPlan
+    SkeletonCodec.decode(new SkeletonCodec.Encoder().plan(plan), spark)
+  }
+
+  test("a limit keeps its value: the planner sizes the subplan from it") {
+    val plan = spark.sql("""select count(*) from (select * from sales limit 918273) t
+      join cust c on t.cust_sk = c.cust_sk""").queryExecution.optimizedPlan
+    val decoded = SkeletonCodec.decode(new SkeletonCodec.Encoder().plan(plan), spark)
+    val limits = plan.collect { case l: GlobalLimit => l.maxRows }
+    assert(limits == Seq(Some(918273L)))
+    assert(decoded.collect { case l: GlobalLimit => l.maxRows } == limits)
+  }
+
+  test("a row count belongs to the top operator of its key; partial and final aggregates differ") {
+    val df = spark.sql("select cust_sk, count(*) from sales where qty = 1 group by cust_sk")
+    df.collect()
+    val qe = df.queryExecution
+    val leafOf = qe.optimizedPlan.collectLeaves().zipWithIndex
+      .flatMap { case (l, i) => l.output.map(_.exprId.id -> i) }.toMap
+    def all(p: SparkPlan): Seq[SparkPlan] = p +: (p match {
+      case s: QueryStageExec => all(s.plan)
+      case o => o.children.flatMap(all)
+    })
+    val nodes = all(Harness.finalPlan(qe))
+    val plan = ReplayCapture.events(0, qe, _ => None)
+      .collectFirst { case p: SparkListenerSQLReplayPlan => p }.get
+    val rows = plan.rowKeys.zip(plan.rowValues).toMap
+    val filter = nodes.collectFirst { case f: FilterExec => f }.get
+    assert(rows(Keys.subtree(filter, leafOf)) == filter.metrics("numOutputRows").value)
+    val aggregates = nodes.collect { case a: BaseAggregateExec => a }
+    assert(aggregates.size == 2)
+    assert(aggregates.map(Keys.subtree(_, leafOf)).distinct.size == 2)
+  }
+
+  test("map output lost with an executor does not drop the capture") {
+    val df = spark.sql(Harness.queries.toMap.apply("q7_byte_skew"))
+    df.collect()
+    def shuffles(): Seq[SparkListenerSQLShuffleStageStats] =
+      ReplayCapture.events(0, df.queryExecution, _ => None)
+        .collect { case s: SparkListenerSQLShuffleStageStats => s }
+    val before = shuffles()
+    assert(before.exists(_.mapSizePartitions.nonEmpty))
+    SparkEnv.get.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster].shuffleStatuses.values
+      .foreach(_.removeOutputsByFilter(_ => true))
+    val after = shuffles()
+    assert(after.map(_.key) == before.map(_.key))
+    assert(after.forall(_.mapSizePartitions.isEmpty))
+  }
+
   test("a failure inside capture is swallowed") {
     val qe = spark.sql("select 1").queryExecution
     val broken = new QueryExecution(spark, qe.logical) {
@@ -181,5 +236,16 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
     info(f"event log ${total / 1024} KiB, replay events ${added / 1024} KiB " +
       f"(${added * 100.0 / (total - added)}%.1f%% growth); capture per query " +
       f"median ${captureMs.sorted.apply(captureMs.size / 2)}%.1f ms, max ${captureMs.max}%.1f ms")
+  }
+
+  // `new SparkContext(conf)`, which PySpark uses, delivers events before the context is active.
+  test("capture is installed although the listener's first event precedes the active context") {
+    assert(SparkContext.getActive.isEmpty)
+    val listener = new ReplayCaptureListener
+    listener.onEvent(SparkListenerApplicationEnd(0L))
+    spark = Harness.session(Map("spark.eventLog.enabled" -> "true",
+      "spark.eventLog.dir" -> logDir.toURI.toString))
+    listener.onEvent(SparkListenerApplicationEnd(0L))
+    assert(spark.sparkContext.listenerBus.findListenersByClass[ReplayCapturer]().size == 1)
   }
 }

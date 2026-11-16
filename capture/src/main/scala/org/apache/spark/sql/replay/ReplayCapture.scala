@@ -49,8 +49,12 @@ object ReplayCapture {
         val stats = s.getRuntimeStatistics
         val bytes = s.mapStats.map(_.bytesByPartitionId).getOrElse(Array.empty[Long])
         val (parts, truncated) = Keys.mapSizePartitions(bytes)
-        val mapSizes = s.mapStats.flatMap(m => tracker.shuffleStatuses.get(m.shuffleId)).map { st =>
-          st.withMapStatuses(ms => parts.map(p => ms.map(_.getSizeForBlock(p))))
+        // A lost executor leaves null statuses: the per-map sizes are then incomplete and not
+        // recorded, and a replay that needs them raises MISSING_MAP_SIZES.
+        val mapSizes = s.mapStats.flatMap(m => tracker.shuffleStatuses.get(m.shuffleId)).flatMap { st =>
+          st.withMapStatuses { ms =>
+            if (ms.contains(null)) None else Some(parts.map(p => ms.map(_.getSizeForBlock(p))))
+          }
         }
         SparkListenerSQLShuffleStageStats(executionId,
           Keys.shufKey(e.child, e.outputPartitioning, leafOf), e.numMappers,
@@ -67,9 +71,12 @@ object ReplayCapture {
         Keys.subtree(b.broadcast.child, leafOf) ->
           ((clamp(stats.sizeInBytes), stats.rowCount.map(clamp).getOrElse(-1L)))
     }.toMap.toSeq
+    // Operators planned from one logical node share a key (a filter and the scan under it).
+    // The key stands for their subplan, whose output is that of the topmost one: `nodes` lists
+    // parents first, and reversed, the topmost is what the map keeps.
     val rows = nodes.flatMap { n =>
       n.metrics.get("numOutputRows").map(v => Keys.subtree(n, leafOf) -> v.value)
-    }.toMap.toSeq
+    }.reverse.toMap.toSeq
 
     SparkListenerSQLReplayPlan(executionId, SPARK_VERSION, root, encoder.opaqueNodes,
       rows.map(_._1).toArray, rows.map(_._2).toArray,
@@ -114,9 +121,15 @@ class ReplayCaptureListener extends SparkFirehoseListener {
   private val installed = new AtomicBoolean
 
   override def onEvent(event: SparkListenerEvent): Unit = {
-    if (installed.compareAndSet(false, true)) {
-      for (sc <- SparkContext.getActive; logger <- sc.eventLogger) {
-        sc.listenerBus.addToEventLogQueue(new ReplayCapturer(logger.onOtherEvent))
+    // The first events can arrive while the context is still being constructed and not yet
+    // active; keep looking until it is.
+    if (!installed.get) {
+      SparkContext.getActive.foreach { sc =>
+        if (installed.compareAndSet(false, true)) {
+          sc.eventLogger.foreach { logger =>
+            sc.listenerBus.addToEventLogQueue(new ReplayCapturer(logger.onOtherEvent))
+          }
+        }
       }
     }
   }

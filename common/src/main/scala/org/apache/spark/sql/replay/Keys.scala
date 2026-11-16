@@ -4,7 +4,9 @@ import org.apache.spark.sql.catalyst.expressions.{Expression, Literal}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive._
+import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
+import org.apache.spark.util.Utils
 
 /**
  * Keys that identify a subplan in the statistics recorded by a run. The same code computes them
@@ -39,9 +41,10 @@ object Keys {
   }
   // A scan that prunes columns has no Project above it, a replayed RDD scan does, so the node
   // name differs between a real run and a replay. Partial and final aggregates share a logical
-  // link, so for them the name is what tells the two apart.
-  def name(p: SparkPlan): String = strip(p).nodeName match {
-    case n if n.contains("Aggregate") => n
+  // link and a node name; only the final one requires a distribution of its child.
+  def name(p: SparkPlan): String = strip(p) match {
+    case a: BaseAggregateExec =>
+      a.nodeName + (if (a.requiredChildDistributionExpressions.isDefined) ":final" else ":partial")
     case _ => "*"
   }
   def link(p: SparkPlan): String = strip(p).logicalLink
@@ -54,12 +57,10 @@ object Keys {
   val MapSizeMinRatio = 2.0
   val MapSizeMaxPartitions = 20
 
-  def median(bytes: Array[Long]): Long = bytes.sorted.apply(bytes.length / 2)
-
   /** Skew candidates among reduce partitions, largest first, and whether the list was cut. */
   def mapSizePartitions(bytes: Array[Long]): (Array[Int], Boolean) = {
     if (bytes.isEmpty) return (Array.empty, false)
-    val threshold = median(bytes) * MapSizeMinRatio
+    val threshold = Utils.median(bytes, false) * MapSizeMinRatio
     val candidates = bytes.indices.filter(i => bytes(i) > threshold)
       .sortBy(i => -bytes(i))
     (candidates.take(MapSizeMaxPartitions).toArray, candidates.size > MapSizeMaxPartitions)

@@ -12,7 +12,8 @@ import com.fasterxml.jackson.databind.node.{ArrayNode, JsonNodeFactory, ObjectNo
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.logical.{Command, LeafNode, LogicalPlan, Statistics}
+import org.apache.spark.sql.catalyst.plans.logical.{Command, GlobalLimit, LeafNode, LocalLimit,
+  LogicalPlan, Offset, Statistics, Tail}
 import org.apache.spark.sql.catalyst.trees.TreeNode
 import org.apache.spark.sql.execution.LogicalRDD
 import org.apache.spark.sql.execution.datasources.{LogicalRelation, WriteFiles}
@@ -111,7 +112,13 @@ object SkeletonCodec {
         rawOpaque = false
         val p = t.asInstanceOf[Product]
         val args = f.arrayNode()
-        (p.productIterator ++ otherCopyArgs(t).iterator).foreach(a => args.add(value(a)))
+        // A limit is not data: the planner sizes the subplan from it, so its value is kept.
+        val isLimit = t.isInstanceOf[GlobalLimit] || t.isInstanceOf[LocalLimit] ||
+          t.isInstanceOf[Offset] || t.isInstanceOf[Tail]
+        (p.productIterator ++ otherCopyArgs(t).iterator).foreach {
+          case l @ Literal(_: Int, IntegerType) if isLimit => args.add(literal(l, keepInt = true))
+          case a => args.add(value(a))
+        }
         val mine = rawOpaque
         rawOpaque = outer
         if (!mine) {
@@ -135,13 +142,14 @@ object SkeletonCodec {
         }
     }
 
-    private def literal(l: Literal): JsonNode = {
+    private def literal(l: Literal, keepInt: Boolean = false): JsonNode = {
       val o = f.objectNode()
       val b = o.putObject("lit")
       b.put("dataType", l.dataType.json)
       (l.value, l.dataType) match {
         case (null, _) => b.putNull("value")
         case (v: Boolean, _) => b.put("value", v)
+        case (v: Int, _) if keepInt => b.put("int", v)
         case (v, dt) => b.put("n", literalIds.getOrElseUpdate((dt, v), literalIds.size + 1))
       }
       o
@@ -292,6 +300,8 @@ object SkeletonCodec {
       val dt = DataType.fromJson(b.get("dataType").asText)
       if (b.has("value")) {
         Literal(if (b.get("value").isNull) null else b.get("value").asBoolean, dt)
+      } else if (b.has("int")) {
+        Literal(b.get("int").asInt, dt)
       } else {
         val n = b.get("n").asInt
         val v: Any = dt match {
@@ -301,7 +311,9 @@ object SkeletonCodec {
           case LongType | TimestampType | TimestampNTZType => n.toLong
           case FloatType => n.toFloat
           case DoubleType => n.toDouble
-          case d: DecimalType => Decimal(BigDecimal(n), d.precision, d.scale)
+          // As the unscaled value, so that it fits any precision and scale.
+          case d: DecimalType =>
+            Decimal(BigDecimal(BigInt(n) % BigInt(10).pow(d.precision), d.scale), d.precision, d.scale)
           case StringType => UTF8String.fromString(s"lit_$n")
           case BinaryType => s"lit_$n".getBytes("UTF-8")
           case other => try Literal.default(other).value catch { case NonFatal(_) => null }

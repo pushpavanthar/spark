@@ -12,6 +12,7 @@ import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.sql.{SparkSession, SparkSessionExtensions}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Statistics}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution._
@@ -19,6 +20,7 @@ import org.apache.spark.sql.execution.adaptive._
 import org.apache.spark.sql.execution.exchange._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.storage.BlockManagerId
+import org.apache.spark.util.Utils
 
 case class Resolved(key: String, shuffleId: Int, numMappers: Int, bytes: Array[Long], dataSize: BigInt,
     rowCount: Option[BigInt])
@@ -111,7 +113,9 @@ object Ctx {
           // The run never shuffled this subplan (it broadcast it, say): no distribution exists.
           flags += "UNSEEN_SHUFFLE"
           val est = e.child.logicalLink.map(_.stats.sizeInBytes).getOrElse(BigInt(1))
-          val bytes = Array.fill(n)((est / n).toLong)
+          val perPartition = est / n
+          val bytes = Array.fill(n)(
+            if (perPartition.isValidLong) perPartition.toLong else Long.MaxValue)
           register(id, Array(bytes))
           Resolved(key, id, 1, bytes, est, None)
       }
@@ -123,7 +127,7 @@ object Ctx {
   private def checkMapSizes(bytes: Array[Long], recorded: Set[Int]): Unit = {
     val conf = SQLConf.get
     val limit = math.max(conf.getConf(SQLConf.SKEW_JOIN_SKEWED_PARTITION_THRESHOLD),
-      (Keys.median(bytes) * conf.getConf(SQLConf.SKEW_JOIN_SKEWED_PARTITION_FACTOR)).toLong)
+      (Utils.median(bytes, false) * conf.getConf(SQLConf.SKEW_JOIN_SKEWED_PARTITION_FACTOR)).toLong)
     if (bytes.indices.exists(i => bytes(i) > limit && !recorded(i))) flags += "MISSING_MAP_SIZES"
   }
 
@@ -142,8 +146,11 @@ object Ctx {
       .orElse(shuf.collectFirst { case (k, s) if k.startsWith(sub + "|") =>
         Statistics(BigInt(s.dataSize), known(s.rowCount)) })
       .orElse(rows.get(sub).map { n =>
-        val perRow = e.child.logicalLink
-          .map(l => l.stats.sizeInBytes / l.stats.rowCount.getOrElse(BigInt(1)).max(1))
+        // Without a row count (no CBO) the size estimate says nothing per row; use the schema.
+        val perRow = e.child.logicalLink.map { l =>
+          l.stats.rowCount.map(r => l.stats.sizeInBytes / r.max(1))
+            .getOrElse(EstimationUtils.getSizePerRow(l.output))
+        }
         Statistics(perRow.getOrElse(BigInt(8)) * n + 1, Some(BigInt(n))) })
       .getOrElse {
         flags += "UNSEEN_BROADCAST"
