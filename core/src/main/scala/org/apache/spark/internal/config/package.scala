@@ -780,6 +780,7 @@ package object config {
         "removes idle executors and when a kill adjusts the requested total. Set by cluster " +
         "managers that start executors of several sizes for one resource profile.")
       .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(false)
 
