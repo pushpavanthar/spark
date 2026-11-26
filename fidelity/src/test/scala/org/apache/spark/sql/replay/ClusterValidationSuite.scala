@@ -7,7 +7,8 @@ import org.scalatest.funsuite.AnyFunSuite
 /**
  * The what-if trace against real reruns on a cluster. Needs the event logs of
  * `cluster/replay_validation.py` runs in `$REPLAY_CLUSTER_LOGS/<run>/<event log>`: a `base-1`
- * run with capture and one run per candidate below. Canceled without them.
+ * run with capture and one run for any of the candidates below. Canceled without them. The traces
+ * go to `target/aro-traces/<name of that directory>/`.
  */
 class ClusterValidationSuite extends AnyFunSuite {
   private type Obj = Map[String, Any]
@@ -26,16 +27,17 @@ class ClusterValidationSuite extends AnyFunSuite {
     val root = sys.env.get("REPLAY_CLUSTER_LOGS").map(new File(_))
     assume(root.isDefined, "REPLAY_CLUSTER_LOGS is not set")
     def log(run: String): String = new File(root.get, run).listFiles().head.getPath
-    val out = new File("target/aro-traces")
-    AroTrace.write(AroTrace.build(log("base-1")), new File(out, "cluster-base-1"))
+    val out = new File("target/aro-traces", root.get.getName)
+    AroTrace.write(AroTrace.build(log("base-1")), new File(out, "base-1"))
     val spark = Harness.session()
     try {
-      val wrong = candidates.flatMap { case (name, conf) =>
+      val ran = candidates.filter { case (name, _) => new File(root.get, name).isDirectory }
+      val wrong = ran.flatMap { case (name, conf) =>
         val real = AroTrace.build(log(name))
-        AroTrace.write(real, new File(out, s"cluster-real-$name"))
+        AroTrace.write(real, new File(out, s"real-$name"))
         try {
           val whatIf = WhatIfTrace.build(spark, log("base-1"), conf)
-          AroTrace.write(whatIf, new File(out, s"cluster-whatif-$name"))
+          AroTrace.write(whatIf, new File(out, s"whatif-$name"))
           val w = whatIf("what_if").asInstanceOf[Obj]
           val same = taskCounts(whatIf) == taskCounts(real)
           info(s"$name: ${w("recut_stages").asInstanceOf[Seq[Obj]].size} stages re-cut, flags " +
