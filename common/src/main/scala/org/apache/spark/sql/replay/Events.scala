@@ -16,6 +16,8 @@ import org.apache.spark.scheduler.SparkListenerEvent
  * @param rowKeys / rowValues observed output rows per subplan key
  * @param broadcastKeys / broadcastDataSize / broadcastRows runtime statistics of each materialized
  *        broadcast; rows is -1 when unknown
+ * @param defaultParallelism the application's default parallelism when the query ended, which is
+ *        the least number of partitions a coalesce leaves; 0 when not recorded
  */
 case class SparkListenerSQLReplayPlan(
     executionId: Long,
@@ -26,7 +28,8 @@ case class SparkListenerSQLReplayPlan(
     rowValues: Array[Long],
     broadcastKeys: Array[String],
     broadcastDataSize: Array[Long],
-    broadcastRows: Array[Long]) extends SparkListenerEvent
+    broadcastRows: Array[Long],
+    defaultParallelism: Int) extends SparkListenerEvent
 
 /**
  * What AQE saw when one shuffle stage finished.

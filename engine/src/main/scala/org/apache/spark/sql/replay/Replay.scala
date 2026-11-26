@@ -224,6 +224,16 @@ object Replay {
         s"captured on Spark ${cap.plan.sparkVersion}, engine is $SPARK_VERSION")
     }
     val logical = SkeletonCodec.decode(cap.plan.root, spark)
+    // A coalesce leaves at least the application's default parallelism, which on a cluster is
+    // its executor cores. The engine's own is unrelated, so the recorded one is pinned.
+    val conf = spark.sessionState.conf
+    val pinParallelism = cap.plan.defaultParallelism > 0 &&
+      conf.getConf(SQLConf.COALESCE_PARTITIONS_PARALLELISM_FIRST) &&
+      conf.getConf(SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_NUM).isEmpty
+    if (pinParallelism) {
+      conf.setConfString(SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_NUM.key,
+        cap.plan.defaultParallelism.toString)
+    }
     Ctx.start(cap, logical)
     try {
       if (cap.plan.opaqueNodes > 0) Ctx.flags += "OPAQUE_NODE"
@@ -238,6 +248,7 @@ object Replay {
       (plan, Ctx.flags.toSeq)
     } finally {
       Ctx.stop()
+      if (pinParallelism) conf.unsetConf(SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_NUM)
     }
   }
 }

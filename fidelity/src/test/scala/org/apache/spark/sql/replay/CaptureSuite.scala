@@ -166,7 +166,7 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
       case o => o.children.flatMap(all)
     })
     val nodes = all(Harness.finalPlan(qe))
-    val plan = ReplayCapture.events(0, qe, _ => None)
+    val plan = ReplayCapture.events(0, qe, _ => None, 0)
       .collectFirst { case p: SparkListenerSQLReplayPlan => p }.get
     val rows = plan.rowKeys.zip(plan.rowValues).toMap
     val filter = nodes.collectFirst { case f: FilterExec => f }.get
@@ -180,7 +180,7 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
     val df = spark.sql(Harness.queries.toMap.apply("q7_byte_skew"))
     df.collect()
     def shuffles(): Seq[SparkListenerSQLShuffleStageStats] =
-      ReplayCapture.events(0, df.queryExecution, _ => None)
+      ReplayCapture.events(0, df.queryExecution, _ => None, 0)
         .collect { case s: SparkListenerSQLShuffleStageStats => s }
     val before = shuffles()
     assert(before.exists(_.mapSizePartitions.nonEmpty))
@@ -207,7 +207,7 @@ class CaptureSuite extends AnyFunSuite with BeforeAndAfterAll {
       val df = spark.sql(sql)
       df.collect()
       val t0 = System.nanoTime()
-      ReplayCapture.events(0, df.queryExecution, _ => None)
+      ReplayCapture.events(0, df.queryExecution, _ => None, 0)
       (System.nanoTime() - t0) / 1e6
     }
     spark.stop()

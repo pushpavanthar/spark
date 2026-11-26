@@ -1,6 +1,8 @@
 """Self-contained workload for validating capture and replay on a cluster.
 
-  replay_validation.py gen <dir> <scale>   writes the synthetic tables (scale 1 = 4M sales rows)
+  replay_validation.py gen <dir> <scale> <event-log-dir>
+                                           writes the synthetic tables (scale 1 = 4M sales
+                                           rows) and creates the event log directory
   replay_validation.py run <dir>           runs the queries; SQL conf comes from the submission
 
 The tables and queries are those of the local fidelity harness (Harness.scala), so results on a
@@ -75,8 +77,11 @@ if __name__ == "__main__":
     session = SparkSession.builder.getOrCreate()
     if mode == "gen":
         gen(session, path, int(sys.argv[3]))
+        # Spark refuses to start with an event log directory that does not exist.
+        logs = session.sparkContext._jvm.org.apache.hadoop.fs.Path(sys.argv[4])
+        logs.getFileSystem(session.sparkContext._jsc.hadoopConfiguration()).mkdirs(logs)
     elif mode == "run":
         run(session, path)
     else:
-        raise SystemExit("usage: replay_validation.py gen <dir> <scale> | run <dir>")
+        raise SystemExit("usage: replay_validation.py gen <dir> <scale> <event-log-dir> | run <dir>")
     session.stop()

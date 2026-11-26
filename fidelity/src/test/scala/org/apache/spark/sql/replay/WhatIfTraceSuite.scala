@@ -48,6 +48,8 @@ class WhatIfTraceSuite extends AnyFunSuite {
     AroTrace.write(recorded, new File("target/aro-traces/baseline"))
 
     assert(recuts.nonEmpty)
+    // Every query of the baseline was captured, the last one before the stop included.
+    assert(!info0("flags").asInstanceOf[Seq[String]].contains("UNCAPTURED_EXECUTION"))
     assert(whatIf("config").asInstanceOf[Map[String, String]].filterKeys(conf.contains) == conf)
     if (exact) assert(taskCounts(whatIf) == taskCounts(real))
   }
@@ -65,6 +67,16 @@ class WhatIfTraceSuite extends AnyFunSuite {
       WhatIfTrace.build(spark, baseline, Map("spark.sql.autoBroadcastJoinThreshold" -> "-1"))
     } finally spark.stop()
     assert(e.getMessage.contains("changes shape"))
+  }
+
+  test("a coalesce is replayed with the recorded default parallelism, not the engine's") {
+    val log = Harness.runWithEventLog(4, "measure", capture,
+      Map("spark.sql.adaptive.coalescePartitions.parallelismFirst" -> "true"))
+    val spark = Harness.session(cores = 2)
+    val whatIf = try {
+      WhatIfTrace.build(spark, log, Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "1m"))
+    } finally spark.stop()
+    assert(whatIf("what_if").asInstanceOf[Obj]("recut_stages").asInstanceOf[Seq[Obj]].nonEmpty)
   }
 
   test("a query without a captured plan is flagged: its stages stay as recorded") {

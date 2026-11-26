@@ -7,7 +7,7 @@ import scala.util.control.NonFatal
 import org.apache.spark.{MapOutputTrackerMaster, SPARK_VERSION, SparkContext, SparkEnv,
   SparkFirehoseListener}
 import org.apache.spark.internal.Logging
-import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent,
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent, SparkListenerJobStart,
   SparkListenerStageSubmitted}
 import org.apache.spark.sql.execution.{CommandResultExec, QueryExecution, SparkPlan}
 import org.apache.spark.sql.execution.adaptive._
@@ -24,9 +24,12 @@ object ReplayCapture {
     case o => o.children.flatMap(allNodes)
   })
 
-  /** @param writerStage the stage that wrote a shuffle, by shuffle id */
-  def events(executionId: Long, qe: QueryExecution,
-      writerStage: Int => Option[Int]): Seq[SparkListenerEvent] = {
+  /**
+   * @param writerStage the stage that wrote a shuffle, by shuffle id
+   * @param defaultParallelism of the application while the query ran; 0 when unknown
+   */
+  def events(executionId: Long, qe: QueryExecution, writerStage: Int => Option[Int],
+      defaultParallelism: Int): Seq[SparkListenerEvent] = {
     val logical = SkeletonCodec.unwrapCommand(qe.optimizedPlan)
     val leafOf = logical.collectLeaves().zipWithIndex
       .flatMap { case (l, i) => l.output.map(_.exprId.id -> i) }.toMap
@@ -81,7 +84,7 @@ object ReplayCapture {
     SparkListenerSQLReplayPlan(executionId, SPARK_VERSION, root, encoder.opaqueNodes,
       rows.map(_._1).toArray, rows.map(_._2).toArray,
       broadcasts.map(_._1).toArray, broadcasts.map(_._2._1).toArray,
-      broadcasts.map(_._2._2).toArray) +: shuffles
+      broadcasts.map(_._2._2).toArray, defaultParallelism) +: shuffles
   }
 }
 
@@ -96,11 +99,21 @@ class ReplayCapturer(emit: SparkListenerEvent => Unit) extends SparkListener wit
   override def onStageSubmitted(e: SparkListenerStageSubmitted): Unit =
     e.stageInfo.shuffleDepId.foreach(writerStage.putIfAbsent(_, e.stageInfo.stageId))
 
+  // Read while a job starts: at the end of the last query the context may already be stopping,
+  // and it then refuses to answer.
+  @volatile private var defaultParallelism = 0
+
+  override def onJobStart(e: SparkListenerJobStart): Unit = {
+    try SparkContext.getActive.foreach(sc => defaultParallelism = sc.defaultParallelism)
+    catch { case NonFatal(_) => }
+  }
+
   override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
     case end: SparkListenerSQLExecutionEnd if end.qe != null =>
       // Capture must never fail or slow the application: anything unexpected is logged and dropped.
       try {
-        ReplayCapture.events(end.executionId, end.qe, writerStage.get).foreach(emit)
+        ReplayCapture.events(end.executionId, end.qe, writerStage.get, defaultParallelism)
+          .foreach(emit)
       } catch {
         case NonFatal(e) => logWarning(s"Replay capture skipped execution ${end.executionId}", e)
       }
