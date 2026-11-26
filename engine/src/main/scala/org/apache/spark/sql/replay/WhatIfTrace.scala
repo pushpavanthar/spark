@@ -306,8 +306,11 @@ object WhatIfTrace {
   /**
    * @param spark a session with [[Replay.install]]; nothing is executed on it
    * @param conf the candidate configuration, on top of what each query ran with
+   * @param repeats event logs of other runs of the job at the recorded configuration; how much
+   *        they differ from each other is how much a real run of the candidate may differ too
    */
-  def build(spark: SparkSession, logPath: String, conf: Map[String, String]): Map[String, Any] = {
+  def build(spark: SparkSession, logPath: String, conf: Map[String, String],
+      repeats: Seq[String] = Nil): Map[String, Any] = {
     val captured = new Captured
     val trace = AroTrace.build(logPath, listeners = Seq(captured))
     val recordedConf = trace("config").asInstanceOf[Map[String, String]]
@@ -325,10 +328,10 @@ object WhatIfTrace {
     val recutKeys = mutable.Set[(Any, Any)]()
     val flags = mutable.LinkedHashSet[String]()
     // A query whose capture failed keeps its recorded stages, whatever the candidate changes.
-    if ((captured.sessionConf.keySet -- captured.plans.map(_.executionId)).nonEmpty) {
-      flags += "UNCAPTURED_EXECUTION"
-    }
+    val uncaptured = (captured.sessionConf.keySet -- captured.plans.map(_.executionId)).toSeq.sorted
+    if (uncaptured.nonEmpty) flags += "UNCAPTURED_EXECUTION"
     val recuts = mutable.Buffer[Obj]()
+    val mismatched = mutable.Buffer[Long]()
     captured.plans.sortBy(_.executionId).foreach { plan =>
       val id = plan.executionId
       val shuffles = captured.shuffles.filter(_.executionId == id).toSeq
@@ -341,7 +344,10 @@ object WhatIfTrace {
         Replay.replay(session, QueryCapture(plan, shuffles))
       }
       val (was, _) = replay(ranWith)
-      if (!Replay.reproduces(was, QueryCapture(plan, shuffles))) flags += "BASELINE_MISMATCH"
+      if (!Replay.reproduces(was, QueryCapture(plan, shuffles))) {
+        flags += "BASELINE_MISMATCH"
+        mismatched += id
+      }
       val (becomes, raised) = replay(ranWith ++ conf)
       flags ++= raised
       if (shape(was) != shape(becomes)) {
@@ -387,9 +393,34 @@ object WhatIfTrace {
       "stages" -> stages.values.toSeq,
       "config" -> (recordedConf ++ conf),
       "what_if" -> Map("conf" -> conf, "flags" -> flags.toSeq, "recut_stages" -> recuts.toSeq,
+        // What the engine could not reproduce of the run itself: no prediction built on those
+        // queries deserves trust, whatever the candidate.
+        "calibration" -> Map("executions" -> captured.sessionConf.size,
+          "reproduced" -> (captured.plans.size - mismatched.size),
+          "mismatched" -> mismatched.toSeq, "uncaptured" -> uncaptured,
+          "ok" -> (mismatched.isEmpty && uncaptured.isEmpty)),
+        "band" -> band(trace, repeats, recuts.nonEmpty, model != recordedModel),
         "spill_model" -> Map("cpu_s_per_gb" -> model.cpuMsPerByte * 1e6,
           "disk_per_spilled" -> model.diskPerSpilled,
           "disk_mb_per_s" -> model.diskBytesPerMs.map(_ / 1e3))))
+  }
+
+  // Largest error of a predicted wall-clock against a real rerun in the cluster validation
+  // (README): 10 configuration candidates and 9 executor shapes of one workload on one cluster.
+  // A candidate that only cuts memory is excluded; it is flagged as a lower bound instead.
+  private val ConfigErrorPct = 16.0
+  private val ShapeErrorPct = 17.0
+
+  /**
+   * How far a real run of the candidate may be from the prediction, in percent of wall-clock:
+   * the run-to-run spread of the job itself, unknown without repeats, and the model's own error.
+   */
+  private def band(trace: Obj, repeats: Seq[String], recut: Boolean, reshaped: Boolean): Obj = {
+    val walls = (trace +: repeats.map(AroTrace.build(_))).map(AroTrace.wallClockSeconds)
+    val noise = if (repeats.isEmpty) None else Some((walls.max - walls.min) / walls.min * 100)
+    val model = math.max(if (recut) ConfigErrorPct else 0.0, if (reshaped) ShapeErrorPct else 0.0)
+    Map("noise_pct" -> noise, "model_pct" -> model,
+      "total_pct" -> noise.map(n => math.sqrt(n * n + model * model)))
   }
 
   /** Writes `outDir/name/trace.json.gz` and returns its path. */

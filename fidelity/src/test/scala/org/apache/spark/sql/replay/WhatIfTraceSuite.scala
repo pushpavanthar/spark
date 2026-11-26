@@ -61,6 +61,20 @@ class WhatIfTraceSuite extends AnyFunSuite {
   // coalesced task counts may differ from the real run by a few.
   check("partitions-32", Map("spark.sql.shuffle.partitions" -> "32"), exact = false)
 
+  test("the band of a prediction: spread of repeated baselines and the model's error") {
+    val spark = Harness.session()
+    val conf = Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "1m")
+    def band(repeats: Seq[String]): Obj = WhatIfTrace.build(spark, baseline, conf, repeats)(
+      "what_if").asInstanceOf[Obj]("band").asInstanceOf[Obj]
+    try {
+      assert(band(Nil)("noise_pct") == None && band(Nil)("total_pct") == None)
+      // A run repeats itself exactly, so the band is the model's error alone.
+      val same = band(Seq(baseline))
+      assert(same("noise_pct") == Some(0.0) && same("total_pct") == Some(same("model_pct")))
+      assert(same("model_pct").asInstanceOf[Double] > 0)
+    } finally spark.stop()
+  }
+
   test("a candidate that changes a join strategy is refused") {
     val spark = Harness.session()
     val e = try intercept[ReplayUnsupportedException] {
@@ -92,5 +106,8 @@ class WhatIfTraceSuite extends AnyFunSuite {
     } finally spark.stop()
     val flags = whatIf("what_if").asInstanceOf[Obj]("flags").asInstanceOf[Seq[String]]
     assert(flags.contains("UNCAPTURED_EXECUTION"))
+    val calibration = whatIf("what_if").asInstanceOf[Obj]("calibration").asInstanceOf[Obj]
+    assert(calibration("uncaptured").asInstanceOf[Seq[Long]].size == 1)
+    assert(calibration("ok") == false)
   }
 }

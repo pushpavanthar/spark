@@ -163,6 +163,23 @@ object AroTrace {
       "driver" -> driver.headOption.map(executor))
   }
 
+  /**
+   * Time during which at least one job of the trace ran. Jobs of one query overlap under AQE,
+   * so their durations cannot be added up.
+   */
+  def wallClockSeconds(trace: Map[String, Any]): Double = {
+    val spans = trace("jobs").asInstanceOf[Seq[Map[String, Any]]].flatMap { j =>
+      for (a <- j("submit_s").asInstanceOf[Option[Double]];
+        b <- j("complete_s").asInstanceOf[Option[Double]]) yield (a, b)
+    }.sorted
+    var total = 0.0
+    var end = Double.NegativeInfinity
+    spans.foreach { case (a, b) =>
+      if (b > end) { total += b - math.max(a, end); end = b }
+    }
+    total
+  }
+
   /** The History Server's timestamp format, which the simulator parses. */
   private def gmt(d: Date): String = {
     val f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'GMT'")
