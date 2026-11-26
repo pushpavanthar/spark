@@ -81,11 +81,18 @@ object ReplayCapture {
       n.metrics.get("numOutputRows").map(v => Keys.subtree(n, leafOf) -> v.value)
     }.reverse.toMap.toSeq
 
+    // A stage is reachable from the final plan and from the stage cache: once per operator.
+    val ops = nodes.map(n => n.id -> n).toMap.values.toSeq.flatMap { n =>
+      val key = Keys.subtree(n, leafOf)
+      n.metrics.toSeq.collect { case (name, m) if m.value > 0 => (key, n.nodeName, name, m.value) }
+    }
+
     SparkListenerSQLReplayPlan(executionId, SPARK_VERSION, root, encoder.opaqueNodes,
       rows.map(_._1).toArray, rows.map(_._2).toArray,
       broadcasts.map(_._1).toArray, broadcasts.map(_._2._1).toArray,
       broadcasts.map(_._2._2).toArray, defaultParallelism,
-      Sig.sig(adaptive.getOrElse(qe.executedPlan))) +: shuffles
+      Sig.sig(adaptive.getOrElse(qe.executedPlan)), ops.map(_._1).toArray, ops.map(_._2).toArray,
+      ops.map(_._3).toArray, ops.map(_._4).toArray) +: shuffles
   }
 }
 

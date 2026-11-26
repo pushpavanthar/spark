@@ -21,6 +21,9 @@ import org.apache.spark.scheduler.SparkListenerEvent
  * @param finalPlan shape of the plan the run ended with, see [[Sig.sig]]; empty when not
  *        recorded. A replay under the recorded configuration that gives another shape cannot
  *        reproduce this run.
+ * @param opKeys / opNodes / opMetrics / opValues every SQL metric of every operator that ran:
+ *        subplan key, node name, metric name, value summed over tasks (times in the metric's
+ *        own unit). What an operator cost, which task metrics do not tell.
  */
 case class SparkListenerSQLReplayPlan(
     executionId: Long,
@@ -33,7 +36,11 @@ case class SparkListenerSQLReplayPlan(
     broadcastDataSize: Array[Long],
     broadcastRows: Array[Long],
     defaultParallelism: Int,
-    finalPlan: String) extends SparkListenerEvent
+    finalPlan: String,
+    opKeys: Array[String],
+    opNodes: Array[String],
+    opMetrics: Array[String],
+    opValues: Array[Long]) extends SparkListenerEvent
 
 /**
  * What AQE saw when one shuffle stage finished.
