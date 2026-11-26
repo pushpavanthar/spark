@@ -20,7 +20,12 @@ class ClusterValidationSuite extends AnyFunSuite {
     "bjt-off" -> Map("spark.sql.autoBroadcastJoinThreshold" -> "-1"),
     "skew-off" -> Map("spark.sql.adaptive.skewJoin.enabled" -> "false"),
     "adv512m" -> Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "512m"),
-    "parts50" -> Map("spark.sql.shuffle.partitions" -> "50"))
+    "parts50" -> Map("spark.sql.shuffle.partitions" -> "50"),
+    "adv256m" -> Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "256m"),
+    "parts100" -> Map("spark.sql.shuffle.partitions" -> "100"),
+    "skewthr1g" -> Map("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes" -> "1g"),
+    "combo" -> Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "512m",
+      "spark.sql.adaptive.skewJoin.enabled" -> "false"))
 
   private def stages(trace: Obj): Seq[Obj] = trace("stages").asInstanceOf[Seq[Obj]]
   private def taskCounts(trace: Obj): Seq[Int] =

@@ -95,19 +95,33 @@ harness tables and queries, scaled) with capture enabled. `ClusterValidationSuit
 logs of a baseline and of candidate runs (`REPLAY_CLUSTER_LOGS`), rewrites the baseline for each
 candidate and compares it with the real rerun.
 
-Measured on 3 executors of 5 cores, 200M rows, broadcast joins off (runs of 6.5 to 9 minutes):
+Measured on 3 executors of 5 cores, 200M rows, broadcast joins off (baselines of 6.5 and 8
+minutes, repeating within 1%). Change in wall-clock against the baseline, real and predicted:
 
-| Candidate | Real change | Predicted change |
-|---|---|---|
-| second baseline | 0% | 0% |
-| coalescing off | -1% | +7% |
-| shuffle partitions 400 to 50 | +3% | +9% |
-| skew join off | +32% | +82% |
-| advisory size 512m | +40% | +29% |
+| Executor memory | Candidate | Real | Predicted | Used to shape the model |
+|---|---|---|---|---|
+| 24g | coalescing off | -1% | +2% | yes |
+| 24g | shuffle partitions 400 to 50 | +3% | +4% | yes |
+| 24g | skew join off | +32% | +42% | yes |
+| 24g | advisory size 512m | +40% | +55% | yes |
+| 24g | shuffle partitions 400 to 100 | +6% | +2% | no |
+| 24g | skew threshold 1g | -2% | 0% | no |
+| 24g | advisory size 256m | +3% | +12% | no |
+| 24g | advisory size 512m and skew join off | +69% | +65% | no |
+| 12g | advisory size 256m | +25% | +29% | no |
+| 12g | skew join off | +33% | +51% | no |
 
-A re-cut task spills what it holds beyond its memory grant; memory per byte is taken from the
-stage's own tasks. The rule was shaped on these same runs, so the table is not an independent
-test of it.
+How a re-cut task is priced:
+- it needs the stage's working memory per byte (what the recorded tasks held plus what they
+  spilled) times what it reads, and spills what exceeds its grant;
+- tasks of an executor share its memory pool, but a task far larger than the rest outlives them
+  and has the pool to itself;
+- a spilled byte costs CPU, and waiting when tasks spilling together share a disk. Both rates
+  are measured on the recorded run's own spilled tasks; without any, the CPU rate is the
+  simulator's constant and the disk limit is unknown.
+
+Known bias: just above the grant the rule predicts spill that does not happen (advisory 256m at
+24g), and a lone giant task is priced too slow (skew join off).
 
 ## Not built yet
 

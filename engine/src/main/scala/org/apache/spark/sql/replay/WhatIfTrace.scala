@@ -30,24 +30,95 @@ object WhatIfTrace {
   private val Additive = Seq("run_ms", "cpu_ms", "gc_ms", "input_bytes", "input_records", "output_bytes", "output_records", "shuffle_read_bytes",
     "shuffle_read_remote_bytes", "shuffle_write_bytes", "shuffle_write_ms")
 
-  // A re-cut task that holds more data than its memory grant spills the excess. What a spilled
-  // GB costs in task time is the simulator's fitted constant (aro_sim memory.py).
-  private val SpillMsPerByte = 3.63 * 1000 / 1e9
+  // What a spilled GB costs in CPU when the run itself has no spilled task to measure it on:
+  // the simulator's fitted constant (aro_sim memory.py).
+  private val DefaultSpillCpuMsPerByte = 3.63 * 1000 / 1e9
+  // ponytail: spill files on disk per byte spilled from memory, when the run never spilled. A
+  // quarter is what the cluster validation runs showed; it follows the data's compressibility.
+  private val DefaultDiskPerSpilled = 0.25
   private val ReservedBytes = 300L << 20
 
   private type Obj = Map[String, Any]
 
-  /** Execution memory one task can count on, in bytes: the pool of an executor over its cores. */
-  private def memoryGrant(conf: Map[String, String]): Double = {
+  /**
+   * How the recorded run spilled, measured on its own tasks so that it holds for this job on
+   * this hardware.
+   *
+   * @param pool execution memory of one executor, in bytes
+   * @param cpuMsPerByte CPU a task spends per byte it spills from memory
+   * @param diskPerSpilled bytes written to disk per byte spilled from memory
+   * @param diskBytesPerMs what the disks behind the executors move when spilling tasks wait on
+   *        them; None when no recorded task waited, so the limit is unknown
+   */
+  private case class SpillModel(pool: Double, cores: Int, executors: Int, cpuMsPerByte: Double,
+      diskPerSpilled: Double, diskBytesPerMs: Option[Double]) {
+    def slots: Int = cores * executors
+
+    /**
+     * Memory each task can hold. Tasks of an executor share its pool equally, but a task far
+     * larger than the rest runs on after they finished and then has the pool to itself: only
+     * tasks at least half its size count as sharing with it.
+     */
+    def grants(read: Seq[Double]): Seq[Double] = read.map { mine =>
+      val peers = math.ceil(read.count(_ >= mine / 2).toDouble / executors).toInt
+      pool / math.min(math.max(peers, 1), cores)
+    }
+
+    /** How many tasks of the stage use the disk while this one does: see `grants`. */
+    def spillPeers(spills: Seq[Double], mine: Double): Int =
+      math.min(math.max(spills.count(s => s > 0 && s >= mine / 2), 1), slots)
+
+    /**
+     * Time each task waits for the disk, given what each spills from memory. A spill is written
+     * once and read back once, and the disk is shared with the tasks spilling alongside.
+     */
+    def diskWaitMs(spills: Seq[Double]): Seq[Double] = spills.map { mine =>
+      diskBytesPerMs.map(2 * mine * diskPerSpilled / _ * spillPeers(spills, mine)).getOrElse(0.0)
+    }
+  }
+
+  private def successful(stage: Obj): Seq[Obj] =
+    stage("tasks").asInstanceOf[Seq[Obj]].filter(_("status") == "SUCCESS")
+
+  private def spillModel(conf: Map[String, String], stages: Iterable[Obj]): SpillModel = {
     def bytes(key: String, default: String): Double =
       JavaUtils.byteStringAsBytes(conf.getOrElse(key, default)).toDouble
     val cores = conf.getOrElse("spark.executor.cores", "1").toInt
-    if (conf.get("spark.memory.offHeap.enabled").contains("true")) {
-      bytes("spark.memory.offHeap.size", "0") / cores
-    } else {
-      (bytes("spark.executor.memory", "1g") - ReservedBytes) *
-        conf.getOrElse("spark.memory.fraction", "0.6").toDouble / cores
+    val pool =
+      if (conf.get("spark.memory.offHeap.enabled").contains("true")) {
+        bytes("spark.memory.offHeap.size", "0")
+      } else {
+        (bytes("spark.executor.memory", "1g") - ReservedBytes) *
+          conf.getOrElse("spark.memory.fraction", "0.6").toDouble
+      }
+    val executors = math.max(conf.getOrElse("spark.executor.instances", "1").toInt, 1)
+
+    // Per stage, tasks that spilled against those that did not: what the first spent beyond the
+    // rate of the second, in CPU and in waiting, is what spilling cost them.
+    var spilled, disk, extraCpu, extraWait, diskTimesTasks = 0.0
+    stages.foreach { stage =>
+      val (wet, calm) = successful(stage).filter(num(_, "shuffle_read_bytes") > 0)
+        .partition(num(_, "spill_mem") > 0)
+      val calmRead = calm.map(num(_, "shuffle_read_bytes")).sum
+      if (wet.nonEmpty && calmRead > 0) {
+        def wait(t: Obj): Double = num(t, "run_ms") - num(t, "cpu_ms")
+        val cpuRate = calm.map(num(_, "cpu_ms")).sum / calmRead
+        val waitRate = calm.map(wait).sum / calmRead
+        val wetRead = wet.map(num(_, "shuffle_read_bytes")).sum
+        spilled += wet.map(num(_, "spill_mem")).sum
+        disk += wet.map(num(_, "spill_disk")).sum
+        extraCpu += wet.map(num(_, "cpu_ms")).sum - cpuRate * wetRead
+        extraWait += wet.map(wait).sum - waitRate * wetRead
+        val spills = wet.map(num(_, "spill_mem"))
+        diskTimesTasks += wet.map { t =>
+          num(t, "spill_disk") * math.min(spills.count(_ >= num(t, "spill_mem") / 2), cores * executors)
+        }.sum
+      }
     }
+    SpillModel(pool, cores, executors,
+      if (spilled > 0 && extraCpu > 0) extraCpu / spilled else DefaultSpillCpuMsPerByte,
+      if (spilled > 0) disk / spilled else DefaultDiskPerSpilled,
+      if (extraWait > 0 && diskTimesTasks > 0) Some(2 * diskTimesTasks / extraWait) else None)
   }
 
   /**
@@ -141,50 +212,48 @@ object WhatIfTrace {
 
   /**
    * The stage with one task per entry of `sizes`. The work its recorded tasks did is shared out
-   * by bytes. Spill is the recorded spill plus the change the memory rule expects: working memory
-   * per byte is what the stage's tasks that did not spill needed, and a task spills what it
-   * holds beyond its grant.
+   * by bytes. Spill is the recorded spill plus the change the memory rule expects: a task holds
+   * the stage's working memory per byte times what it reads, and spills what exceeds its grant.
    */
-  private def recut(stage: Obj, sizes: Seq[Long], grant: Double): Obj = {
-    val src = stage("tasks").asInstanceOf[Seq[Obj]].filter(_("status") == "SUCCESS")
-      .sortBy(num(_, "index"))
+  private def recut(stage: Obj, sizes: Seq[Long], model: SpillModel): Obj = {
+    val src = successful(stage).sortBy(num(_, "index"))
     val total = sizes.sum.toDouble
     val share = sizes.map(s => if (total > 0) s / total else 1.0 / sizes.length)
     val fetch = src.map(t => math.min(num(t, "duration_ms"), num(t, "shuffle_fetch_wait_ms"))).sum
     val newFetch = fetch * math.pow(sizes.length.toDouble / src.length, FetchPartitionExp)
 
     val read = src.map(num(_, "shuffle_read_bytes"))
-    // Working memory per byte read. A task that spilled shows it directly: what it held plus
-    // what it spilled. Small tasks overstate it (buffers have a minimum size), so tasks that
-    // did not spill are only used when none did.
-    val (wet, calm) = src.partition(num(_, "spill_mem") > 0)
-    val basis = if (wet.nonEmpty) wet else calm
-    val basisRead = basis.map(num(_, "shuffle_read_bytes")).sum
+    // What a task held plus what it spilled is what it needed.
     val memoryPerByte =
-      if (basisRead > 0) basis.map(t => num(t, "peak_exec_mem") + num(t, "spill_mem")).sum / basisRead
+      if (read.sum > 0) src.map(t => num(t, "peak_exec_mem") + num(t, "spill_mem")).sum / read.sum
       else 0.0
-    def expectedSpill(bytes: Double): Double = math.max(0.0, memoryPerByte * bytes - grant)
+    def expectedSpill(reads: Seq[Double]): Seq[Double] =
+      reads.zip(model.grants(reads)).map { case (r, g) => math.max(0.0, memoryPerByte * r - g) }
     val newRead = share.map(_ * read.sum)
-    val expected = newRead.map(expectedSpill)
+    val expected = expectedSpill(newRead)
     val spilled = src.map(num(_, "spill_mem")).sum
-    val spill = math.max(0.0, spilled + expected.sum - read.map(expectedSpill).sum)
-    // ponytail: disk bytes per spilled byte as recorded; a stage that never spilled gets none,
-    // so node disk is underestimated for it. Fit a ratio if the disk model starts to matter.
-    val diskPerSpilled = if (spilled > 0) src.map(num(_, "spill_disk")).sum / spilled else 0.0
-    val work = math.max(0.0,
-      src.map(num(_, "duration_ms")).sum - fetch - spilled * SpillMsPerByte)
+    val spill = math.max(0.0, spilled + expected.sum - expectedSpill(read).sum)
+    val mine = share.indices.map { j =>
+      if (expected.sum > 0) spill * expected(j) / expected.sum else spill * share(j)
+    }
+    val diskWait = model.diskWaitMs(mine)
+    // Take out what the recorded tasks spent spilling; the new tasks get their own.
+    val work = math.max(0.0, src.map(num(_, "duration_ms")).sum - fetch -
+      spilled * model.cpuMsPerByte -
+      model.diskWaitMs(src.map(num(_, "spill_mem"))).sum)
 
+    val grants = model.grants(newRead)
     val sums = Additive.map(k => k -> src.map(num(_, k)).sum).toMap
     val tasks = share.indices.map { j =>
       val w = share(j)
-      val mine = if (expected.sum > 0) spill * expected(j) / expected.sum else spill * w
+      val spilling = mine(j) * model.cpuMsPerByte + diskWait(j)
       // Executor, host and launch time of the recorded task at the same relative position.
       src(j * src.length / sizes.length) ++ sums.map { case (k, v) => k -> v * w } ++ Map(
         "index" -> j, "attempt" -> 0,
-        "duration_ms" -> ((work + newFetch) * w + mine * SpillMsPerByte),
+        "duration_ms" -> ((work + newFetch) * w + spilling),
         "shuffle_fetch_wait_ms" -> newFetch * w,
-        "peak_exec_mem" -> math.min(memoryPerByte * newRead(j), grant), "spill_mem" -> mine,
-        "spill_disk" -> mine * diskPerSpilled)
+        "peak_exec_mem" -> math.min(memoryPerByte * newRead(j), grants(j)),
+        "spill_mem" -> mine(j), "spill_disk" -> mine(j) * model.diskPerSpilled)
     }
     stage ++ Map("tasks" -> tasks, "num_tasks" -> sizes.length)
   }
@@ -206,7 +275,7 @@ object WhatIfTrace {
     def parents(s: Obj): Set[Int] =
       s("parents_inferred").asInstanceOf[Seq[Int]].map(p => sameAs.getOrElse(p, p)).toSet
 
-    val grant = memoryGrant(recordedConf)
+    val model = spillModel(recordedConf, stages.values)
     val flags = mutable.LinkedHashSet[String]()
     // A query whose capture failed keeps its recorded stages, whatever the candidate changes.
     if ((captured.sessionConf.keySet -- captured.plans.map(_.executionId)).nonEmpty) {
@@ -249,7 +318,7 @@ object WhatIfTrace {
             unsupported(s"execution $id: stage ${key._1} ran $before tasks, its replay has " +
               s"${old.sizes.get.length}")
           }
-          stages(key) = recut(stages(key), cut.sizes.get, grant)
+          stages(key) = recut(stages(key), cut.sizes.get, model)
           recuts += Map("stage_id" -> key._1, "tasks_before" -> before,
             "tasks_after" -> cut.sizes.get.length)
         case _ =>
@@ -258,7 +327,10 @@ object WhatIfTrace {
     trace ++ Map(
       "stages" -> stages.values.toSeq,
       "config" -> (recordedConf ++ conf),
-      "what_if" -> Map("conf" -> conf, "flags" -> flags.toSeq, "recut_stages" -> recuts.toSeq))
+      "what_if" -> Map("conf" -> conf, "flags" -> flags.toSeq, "recut_stages" -> recuts.toSeq,
+        "spill_model" -> Map("cpu_s_per_gb" -> model.cpuMsPerByte * 1e6,
+          "disk_per_spilled" -> model.diskPerSpilled,
+          "disk_mb_per_s" -> model.diskBytesPerMs.map(_ / 1e3))))
   }
 
   /** Writes `outDir/name/trace.json.gz` and returns its path. */
