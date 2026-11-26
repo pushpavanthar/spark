@@ -9,6 +9,7 @@ import scala.util.control.NonFatal
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.node.{ArrayNode, JsonNodeFactory, ObjectNode}
 
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
@@ -288,11 +289,19 @@ object SkeletonCodec {
         b.get("nullable").asBoolean)(ExprId(b.get("exprId").asLong, replayJvmId),
         b.get("qualifier").elements().asScala.map(x => any(x).asInstanceOf[String]).toList)
 
+    // Spark reuses an exchange whose subplan it has already planned, down to the scan. Two reads
+    // of one relation with the same columns and statistics must therefore plan to equal scans,
+    // which for an RDD scan means the same RDD.
+    private val scans = mutable.Map[String, RDD[InternalRow]]()
+
     private def leaf(b: JsonNode): LogicalPlan = {
       val output = b.get("output").elements().asScala.map(x => any(x).asInstanceOf[Attribute]).toList
       val stats = Statistics(BigInt(b.get("sizeInBytes").asText),
         Option(b.get("rowCount")).map(r => BigInt(r.asText)))
-      LogicalRDD(output, session.sparkContext.emptyRDD[InternalRow])(session, Some(stats), None)
+      val same = Seq(b.get("relation").asText, stats.sizeInBytes, stats.rowCount,
+        output.map(a => a.name -> a.dataType)).mkString("|")
+      val rdd = scans.getOrElseUpdate(same, session.sparkContext.emptyRDD[InternalRow])
+      LogicalRDD(output, rdd)(session, Some(stats), None)
     }
 
     // The value is gone; what is kept is the type and which literals were equal to each other.

@@ -84,7 +84,8 @@ object ReplayCapture {
     SparkListenerSQLReplayPlan(executionId, SPARK_VERSION, root, encoder.opaqueNodes,
       rows.map(_._1).toArray, rows.map(_._2).toArray,
       broadcasts.map(_._1).toArray, broadcasts.map(_._2._1).toArray,
-      broadcasts.map(_._2._2).toArray, defaultParallelism) +: shuffles
+      broadcasts.map(_._2._2).toArray, defaultParallelism,
+      Sig.sig(adaptive.getOrElse(qe.executedPlan))) +: shuffles
   }
 }
 

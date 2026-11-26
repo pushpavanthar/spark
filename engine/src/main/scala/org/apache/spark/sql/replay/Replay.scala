@@ -210,6 +210,14 @@ case class ReplayExchangeRule(session: SparkSession) extends Rule[SparkPlan] {
 }
 
 object Replay {
+  /**
+   * Whether a replay under the recorded configuration gave the plan the run ended with. It may
+   * not: which side of a join AQE broadcasts can depend on which stage finished first, and a
+   * replay finishes them all at once.
+   */
+  def reproduces(plan: SparkPlan, cap: QueryCapture): Boolean =
+    cap.plan.finalPlan == null || cap.plan.finalPlan.isEmpty || Sig.sig(plan) == cap.plan.finalPlan
+
   /** Register on the engine's session: `SparkSession.builder().withExtensions(Replay.install)`. */
   def install(e: SparkSessionExtensions): Unit = e.injectQueryStagePrepRule(s => ReplayExchangeRule(s))
 

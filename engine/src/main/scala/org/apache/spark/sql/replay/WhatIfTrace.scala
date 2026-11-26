@@ -294,6 +294,7 @@ object WhatIfTrace {
         Replay.replay(session, QueryCapture(plan, shuffles))
       }
       val (was, _) = replay(ranWith)
+      if (!Replay.reproduces(was, QueryCapture(plan, shuffles))) flags += "BASELINE_MISMATCH"
       val (becomes, raised) = replay(ranWith ++ conf)
       flags ++= raised
       if (shape(was) != shape(becomes)) {

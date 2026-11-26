@@ -61,7 +61,8 @@ conf.update(extra)
 driver = pod("regnp32driver1", cores=2, memory="8g")
 driver["volumeMounts"] = [{"name": "replay", "mountPath": "/opt/replay"},
                           {"name": "extra", "mountPath": "/opt/extra"}]
-executor = pod("spnp32sparknp1", instances=3, cores=5,
+executor = pod("spnp32sparknp1", instances=int(os.environ.get("REPLAY_EXECUTORS", "3")),
+               cores=int(os.environ.get("REPLAY_EXECUTOR_CORES", "5")),
                memory=os.environ.get("REPLAY_EXECUTOR_MEMORY", "24g"))
 executor["volumeMounts"] = [{"name": "extra", "mountPath": "/opt/extra"}]
 

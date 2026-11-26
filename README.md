@@ -85,6 +85,7 @@ A prediction carries a flag whenever it used something the run did not record.
 | `EXTRAPOLATED_PARTITIONS` | Partition count does not divide the recorded one; sizes are a uniform guess |
 | `UNSEEN_SHUFFLE` / `UNSEEN_BROADCAST` | The run never materialized this subplan that way; statistics are estimated |
 | `MISSING_MAP_SIZES` | The replayed skew settings call a partition skewed for which no per-map sizes were recorded |
+| `BASELINE_MISMATCH` | What-if trace only: replayed under its recorded configuration, a query does not give the plan it really ended with |
 | `UNCAPTURED_EXECUTION` | What-if trace only: a query has no captured plan, so its stages stay as recorded |
 | `OPAQUE_NODE` | The skeleton holds an expression the codec could not represent (a UDF, a set of values) |
 

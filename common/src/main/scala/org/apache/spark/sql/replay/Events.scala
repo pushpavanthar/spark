@@ -18,6 +18,9 @@ import org.apache.spark.scheduler.SparkListenerEvent
  *        broadcast; rows is -1 when unknown
  * @param defaultParallelism the application's default parallelism when the query ended, which is
  *        the least number of partitions a coalesce leaves; 0 when not recorded
+ * @param finalPlan shape of the plan the run ended with, see [[Sig.sig]]; empty when not
+ *        recorded. A replay under the recorded configuration that gives another shape cannot
+ *        reproduce this run.
  */
 case class SparkListenerSQLReplayPlan(
     executionId: Long,
@@ -29,7 +32,8 @@ case class SparkListenerSQLReplayPlan(
     broadcastKeys: Array[String],
     broadcastDataSize: Array[Long],
     broadcastRows: Array[Long],
-    defaultParallelism: Int) extends SparkListenerEvent
+    defaultParallelism: Int,
+    finalPlan: String) extends SparkListenerEvent
 
 /**
  * What AQE saw when one shuffle stage finished.
