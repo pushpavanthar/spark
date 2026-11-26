@@ -25,7 +25,20 @@ class ClusterValidationSuite extends AnyFunSuite {
     "parts100" -> Map("spark.sql.shuffle.partitions" -> "100"),
     "skewthr1g" -> Map("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes" -> "1g"),
     "combo" -> Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "512m",
-      "spark.sql.adaptive.skewJoin.enabled" -> "false"))
+      "spark.sql.adaptive.skewJoin.enabled" -> "false")) ++
+    // Another executor shape, executors x cores x heap, alone and with a configuration change.
+    Seq("2x5x24", "3x3x24", "3x5x8", "3x5x12", "5x3x14", "6x2x12").map(n => n -> shape(n)) ++
+    Seq("2x5x24-adv512m" -> (shape("2x5x24") +
+        ("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "512m")),
+      "3x5x12-adv256m" -> (shape("3x5x12") +
+        ("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "256m")),
+      "3x5x12-skew-off" -> (shape("3x5x12") + ("spark.sql.adaptive.skewJoin.enabled" -> "false")))
+
+  private def shape(name: String): Map[String, String] = {
+    val Array(executors, cores, heap) = name.split("x")
+    Map("spark.executor.instances" -> executors, "spark.executor.cores" -> cores,
+      "spark.executor.memory" -> s"${heap}g")
+  }
 
   private def stages(trace: Obj): Seq[Obj] = trace("stages").asInstanceOf[Seq[Obj]]
   private def taskCounts(trace: Obj): Seq[Int] =

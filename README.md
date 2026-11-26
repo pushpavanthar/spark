@@ -86,6 +86,7 @@ A prediction carries a flag whenever it used something the run did not record.
 | `UNSEEN_SHUFFLE` / `UNSEEN_BROADCAST` | The run never materialized this subplan that way; statistics are estimated |
 | `MISSING_MAP_SIZES` | The replayed skew settings call a partition skewed for which no per-map sizes were recorded |
 | `BASELINE_MISMATCH` | What-if trace only: replayed under its recorded configuration, a query does not give the plan it really ended with |
+| `LESS_MEMORY_LOWER_BOUND` | What-if trace only: the candidate gives executors less memory; time lost to a smaller page cache is not priced, so the real run is slower |
 | `UNCAPTURED_EXECUTION` | What-if trace only: a query has no captured plan, so its stages stay as recorded |
 | `OPAQUE_NODE` | The skeleton holds an expression the codec could not represent (a UDF, a set of values) |
 
@@ -120,6 +121,35 @@ How a re-cut task is priced:
 - a spilled byte costs CPU, and waiting when tasks spilling together share a disk. Both rates
   are measured on the recorded run's own spilled tasks; without any, the CPU rate is the
   simulator's constant and the disk limit is unknown.
+
+Another executor shape is a candidate like any other (`spark.executor.instances`, `.cores`,
+`.memory`): every stage is re-priced, the simulator then only schedules. Baseline 3 executors x 5
+cores x 24g:
+
+| Shape, executors x cores x heap | Candidate | Real | Predicted |
+|---|---|---|---|
+| 2 x 5 x 24g | | +14% | +13% |
+| 3 x 3 x 24g | | +11% | +19% |
+| 5 x 3 x 14g | | +8% | +4% |
+| 6 x 2 x 12g | | +21% | +11% |
+| 3 x 5 x 12g | | +24% | +5% |
+| 3 x 5 x 8g | | +53% | +9% |
+| 2 x 5 x 24g | advisory size 512m | +48% | +68% |
+| 3 x 5 x 12g | advisory size 256m | +55% | +59% |
+| 3 x 5 x 12g | skew join off | +64% | +54% |
+
+- time a task waits without using CPU is waiting for a device its neighbours share, and scales
+  with the number of task slots (70% of scan time on this cluster);
+- spill is re-priced under the new memory grant.
+Less memory alone is predicted too fast: small executors keep little of the shuffle files in the
+page cache and read them back from disk, which is not priced (flag `LESS_MEMORY_LOWER_BOUND`).
+
+## Plans of TPC-DS
+
+`TpcdsSuite` runs the 103 TPC-DS queries of Spark's test resources on generated data and replays
+each at its recorded configuration: 94 to 98 reproduce the plan the run ended with. The others
+are joins where both sides can be broadcast: the real run keeps the side whose stage finished
+first, the replay finishes all stages at once. They carry `BASELINE_MISMATCH`.
 
 Known bias: just above the grant the rule predicts spill that does not happen (advisory 256m at
 24g), and a lone giant task is priced too slow (skew join off).
