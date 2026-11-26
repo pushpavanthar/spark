@@ -5,6 +5,7 @@ import java.io.File
 import scala.collection.mutable
 
 import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
+import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive._
@@ -26,11 +27,28 @@ object WhatIfTrace {
   private val FetchPartitionExp = 0.89
 
   // Task metrics that add up over a stage and follow the data: a task gets its share of bytes.
-  private val Additive = Seq("run_ms", "cpu_ms", "gc_ms", "peak_exec_mem", "spill_mem",
-    "spill_disk", "input_bytes", "input_records", "output_bytes", "output_records", "shuffle_read_bytes",
+  private val Additive = Seq("run_ms", "cpu_ms", "gc_ms", "input_bytes", "input_records", "output_bytes", "output_records", "shuffle_read_bytes",
     "shuffle_read_remote_bytes", "shuffle_write_bytes", "shuffle_write_ms")
 
+  // A re-cut task that holds more data than its memory grant spills the excess. What a spilled
+  // GB costs in task time is the simulator's fitted constant (aro_sim memory.py).
+  private val SpillMsPerByte = 3.63 * 1000 / 1e9
+  private val ReservedBytes = 300L << 20
+
   private type Obj = Map[String, Any]
+
+  /** Execution memory one task can count on, in bytes: the pool of an executor over its cores. */
+  private def memoryGrant(conf: Map[String, String]): Double = {
+    def bytes(key: String, default: String): Double =
+      JavaUtils.byteStringAsBytes(conf.getOrElse(key, default)).toDouble
+    val cores = conf.getOrElse("spark.executor.cores", "1").toInt
+    if (conf.get("spark.memory.offHeap.enabled").contains("true")) {
+      bytes("spark.memory.offHeap.size", "0") / cores
+    } else {
+      (bytes("spark.executor.memory", "1g") - ReservedBytes) *
+        conf.getOrElse("spark.memory.fraction", "0.6").toDouble / cores
+    }
+  }
 
   /**
    * One scheduler stage of a replayed plan.
@@ -121,21 +139,52 @@ object WhatIfTrace {
 
   private def num(o: Obj, key: String): Double = o(key).asInstanceOf[Number].doubleValue
 
-  /** The stage with one task per entry of `sizes`, sharing out the work its recorded tasks did. */
-  private def recut(stage: Obj, sizes: Seq[Long]): Obj = {
+  /**
+   * The stage with one task per entry of `sizes`. The work its recorded tasks did is shared out
+   * by bytes. Spill is the recorded spill plus the change the memory rule expects: working memory
+   * per byte is what the stage's tasks that did not spill needed, and a task spills what it
+   * holds beyond its grant.
+   */
+  private def recut(stage: Obj, sizes: Seq[Long], grant: Double): Obj = {
     val src = stage("tasks").asInstanceOf[Seq[Obj]].filter(_("status") == "SUCCESS")
       .sortBy(num(_, "index"))
     val total = sizes.sum.toDouble
     val share = sizes.map(s => if (total > 0) s / total else 1.0 / sizes.length)
     val fetch = src.map(t => math.min(num(t, "duration_ms"), num(t, "shuffle_fetch_wait_ms"))).sum
-    val other = src.map(num(_, "duration_ms")).sum - fetch
     val newFetch = fetch * math.pow(sizes.length.toDouble / src.length, FetchPartitionExp)
+
+    val read = src.map(num(_, "shuffle_read_bytes"))
+    // Working memory per byte read. A task that spilled shows it directly: what it held plus
+    // what it spilled. Small tasks overstate it (buffers have a minimum size), so tasks that
+    // did not spill are only used when none did.
+    val (wet, calm) = src.partition(num(_, "spill_mem") > 0)
+    val basis = if (wet.nonEmpty) wet else calm
+    val basisRead = basis.map(num(_, "shuffle_read_bytes")).sum
+    val memoryPerByte =
+      if (basisRead > 0) basis.map(t => num(t, "peak_exec_mem") + num(t, "spill_mem")).sum / basisRead
+      else 0.0
+    def expectedSpill(bytes: Double): Double = math.max(0.0, memoryPerByte * bytes - grant)
+    val newRead = share.map(_ * read.sum)
+    val expected = newRead.map(expectedSpill)
+    val spilled = src.map(num(_, "spill_mem")).sum
+    val spill = math.max(0.0, spilled + expected.sum - read.map(expectedSpill).sum)
+    // ponytail: disk bytes per spilled byte as recorded; a stage that never spilled gets none,
+    // so node disk is underestimated for it. Fit a ratio if the disk model starts to matter.
+    val diskPerSpilled = if (spilled > 0) src.map(num(_, "spill_disk")).sum / spilled else 0.0
+    val work = math.max(0.0,
+      src.map(num(_, "duration_ms")).sum - fetch - spilled * SpillMsPerByte)
+
     val sums = Additive.map(k => k -> src.map(num(_, k)).sum).toMap
-    val tasks = share.zipWithIndex.map { case (w, j) =>
+    val tasks = share.indices.map { j =>
+      val w = share(j)
+      val mine = if (expected.sum > 0) spill * expected(j) / expected.sum else spill * w
       // Executor, host and launch time of the recorded task at the same relative position.
       src(j * src.length / sizes.length) ++ sums.map { case (k, v) => k -> v * w } ++ Map(
         "index" -> j, "attempt" -> 0,
-        "duration_ms" -> (other + newFetch) * w, "shuffle_fetch_wait_ms" -> newFetch * w)
+        "duration_ms" -> ((work + newFetch) * w + mine * SpillMsPerByte),
+        "shuffle_fetch_wait_ms" -> newFetch * w,
+        "peak_exec_mem" -> math.min(memoryPerByte * newRead(j), grant), "spill_mem" -> mine,
+        "spill_disk" -> mine * diskPerSpilled)
     }
     stage ++ Map("tasks" -> tasks, "num_tasks" -> sizes.length)
   }
@@ -157,6 +206,7 @@ object WhatIfTrace {
     def parents(s: Obj): Set[Int] =
       s("parents_inferred").asInstanceOf[Seq[Int]].map(p => sameAs.getOrElse(p, p)).toSet
 
+    val grant = memoryGrant(recordedConf)
     val flags = mutable.LinkedHashSet[String]()
     // A query whose capture failed keeps its recorded stages, whatever the candidate changes.
     if ((captured.sessionConf.keySet -- captured.plans.map(_.executionId)).nonEmpty) {
@@ -199,7 +249,7 @@ object WhatIfTrace {
             unsupported(s"execution $id: stage ${key._1} ran $before tasks, its replay has " +
               s"${old.sizes.get.length}")
           }
-          stages(key) = recut(stages(key), cut.sizes.get)
+          stages(key) = recut(stages(key), cut.sizes.get, grant)
           recuts += Map("stage_id" -> key._1, "tasks_before" -> before,
             "tasks_after" -> cut.sizes.get.length)
         case _ =>

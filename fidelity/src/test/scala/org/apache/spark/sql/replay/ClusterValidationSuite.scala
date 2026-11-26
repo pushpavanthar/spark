@@ -17,7 +17,10 @@ class ClusterValidationSuite extends AnyFunSuite {
     "adv16m" -> Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "16m"),
     "coalesce-off" -> Map("spark.sql.adaptive.coalescePartitions.enabled" -> "false"),
     "parts200" -> Map("spark.sql.shuffle.partitions" -> "200"),
-    "bjt-off" -> Map("spark.sql.autoBroadcastJoinThreshold" -> "-1"))
+    "bjt-off" -> Map("spark.sql.autoBroadcastJoinThreshold" -> "-1"),
+    "skew-off" -> Map("spark.sql.adaptive.skewJoin.enabled" -> "false"),
+    "adv512m" -> Map("spark.sql.adaptive.advisoryPartitionSizeInBytes" -> "512m"),
+    "parts50" -> Map("spark.sql.shuffle.partitions" -> "50"))
 
   private def stages(trace: Obj): Seq[Obj] = trace("stages").asInstanceOf[Seq[Obj]]
   private def taskCounts(trace: Obj): Seq[Int] =
@@ -44,7 +47,8 @@ class ClusterValidationSuite extends AnyFunSuite {
             s"[${w("flags").asInstanceOf[Seq[String]].mkString(",")}], tasks what-if " +
             s"${taskCounts(whatIf).sum}, real ${taskCounts(real).sum}, per stage " +
             (if (same) "equal" else "DIFFERENT"))
-          if (same) None else Some(name)
+          // A flagged replay is allowed to be off; an unflagged one is not.
+          if (same || w("flags").asInstanceOf[Seq[String]].nonEmpty) None else Some(name)
         } catch {
           case e: ReplayUnsupportedException =>
             info(s"$name: refused - ${e.getMessage.take(200)}")

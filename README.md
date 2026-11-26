@@ -88,6 +88,27 @@ A prediction carries a flag whenever it used something the run did not record.
 | `UNCAPTURED_EXECUTION` | What-if trace only: a query has no captured plan, so its stages stay as recorded |
 | `OPAQUE_NODE` | The skeleton holds an expression the codec could not represent (a UDF, a set of values) |
 
+## Cluster validation
+
+`cluster/submit.py` prints a SparkApplication that runs `cluster/replay_validation.py` (the
+harness tables and queries, scaled) with capture enabled. `ClusterValidationSuite` takes the event
+logs of a baseline and of candidate runs (`REPLAY_CLUSTER_LOGS`), rewrites the baseline for each
+candidate and compares it with the real rerun.
+
+Measured on 3 executors of 5 cores, 200M rows, broadcast joins off (runs of 6.5 to 9 minutes):
+
+| Candidate | Real change | Predicted change |
+|---|---|---|
+| second baseline | 0% | 0% |
+| coalescing off | -1% | +7% |
+| shuffle partitions 400 to 50 | +3% | +9% |
+| skew join off | +32% | +82% |
+| advisory size 512m | +40% | +29% |
+
+A re-cut task spills what it holds beyond its memory grant; memory per byte is taken from the
+stage's own tasks. The rule was shaped on these same runs, so the table is not an independent
+test of it.
+
 ## Not built yet
 
 Pack store, service API, LLM loop. Time and resources are predicted by the simulator, not here. See the plan's
