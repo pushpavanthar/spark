@@ -40,6 +40,10 @@ object Ctx {
   private var bx = Map[String, Statistics]()
   private var rows = Map[String, Long]()
 
+  // Shuffle bytes per byte of rows, for a query that wrote no other shuffle to measure it on.
+  // What the cluster validation workload showed (43.6 GB written for 66.9 GB of rows).
+  private val UnseenShuffleCompression = 0.65
+
   private def tracker: MapOutputTrackerMaster =
     SparkEnv.get.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
 
@@ -63,6 +67,21 @@ object Ctx {
     resolved.values.foreach(r => tracker.unregisterShuffle(r.shuffleId))
     resolved.clear(); flags.clear()
   }
+
+  // Rows the run counted for a subplan. A projection the run fused into its child has no count
+  // of its own, and passes on its child's.
+  private def countedRows(p: SparkPlan): Option[Long] =
+    rows.get(Keys.subtree(p, leafOf)).orElse(Keys.strip(p) match {
+      case project: ProjectExec => countedRows(project.child)
+      case _ => None
+    })
+
+  /** Position among the leaves of the last replayed query of the leaf this scan reads. */
+  def leafIndex(scan: SparkPlan): Option[Int] =
+    synchronized(scan.output.headOption.flatMap(a => leafOf.get(a.exprId.id)))
+
+  /** Key of a subplan of the last replayed plan in the recorded statistics. */
+  def key(p: SparkPlan): String = synchronized(Keys.subtree(p, leafOf))
 
   /** Per-map sizes as [map][partition]: recorded for skew candidates, an even split elsewhere. */
   private def mapSizes(rec: SparkListenerSQLShuffleStageStats): Array[Array[Long]] = {
@@ -111,13 +130,23 @@ object Ctx {
           Resolved(key, id, rec.numMappers, bytes, BigInt(rec.dataSize), known(rec.rowCount))
         case None =>
           // The run never shuffled this subplan (it broadcast it, say): no distribution exists.
+          // Its volume can still be told: the rows the run counted for the subplan, as wide as
+          // their schema, compressed like the shuffles the query did write. Spread evenly, so a
+          // skewed key is not seen.
           flags += "UNSEEN_SHUFFLE"
-          val est = e.child.logicalLink.map(_.stats.sizeInBytes).getOrElse(BigInt(1))
-          val perPartition = est / n
+          val counted = countedRows(e.child).map(BigInt(_))
+          val dataSize = counted.map(_ * EstimationUtils.getSizePerRow(e.child.output))
+            .getOrElse(e.child.logicalLink.map(_.stats.sizeInBytes).getOrElse(BigInt(1)))
+          val written = shuf.values.filter(_.bytesByPartitionId.nonEmpty)
+          val compression =
+            if (written.map(_.dataSize).sum > 0) {
+              written.map(_.bytesByPartitionId.sum.toDouble).sum / written.map(_.dataSize).sum
+            } else UnseenShuffleCompression
+          val perPartition = (BigDecimal(dataSize) * compression / n).toBigInt
           val bytes = Array.fill(n)(
             if (perPartition.isValidLong) perPartition.toLong else Long.MaxValue)
           register(id, Array(bytes))
-          Resolved(key, id, 1, bytes, est, None)
+          Resolved(key, id, 1, bytes, dataSize, counted)
       }
     })
   }

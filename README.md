@@ -70,8 +70,8 @@ count, and its recorded work is shared out by the bytes of each new partition (f
 the task count as in the simulator's own cost model). The trace gains a `what_if` section with the
 flags raised and the stages re-cut.
 
-- Only repartitioning is exported. A candidate that changes a plan's shape (a join strategy, an
-  exchange) is refused.
+- A candidate that changes a plan's shape (a join strategy, an exchange) is priced by rule, see
+  "A candidate that changes the plan".
 - The log must come from a run with capture enabled.
 - No per-task fixed cost is modelled: a candidate with many more, smaller tasks is predicted too fast.
 
@@ -87,6 +87,7 @@ A prediction carries a flag whenever it used something the run did not record.
 | `MISSING_MAP_SIZES` | The replayed skew settings call a partition skewed for which no per-map sizes were recorded |
 | `BASELINE_MISMATCH` | What-if trace only: replayed under its recorded configuration, a query does not give the plan it really ended with |
 | `LESS_MEMORY_LOWER_BOUND` | What-if trace only: the candidate gives executors less memory; time lost to a smaller page cache is not priced, so the real run is slower |
+| `PLAN_SHAPE_CHANGED` | What-if trace only: the candidate changes a query's joins or exchanges; its stages are built from the plan and priced by rule, not from recorded tasks |
 | `UNCAPTURED_EXECUTION` | What-if trace only: a query has no captured plan, so its stages stay as recorded |
 | `OPAQUE_NODE` | The skeleton holds an expression the codec could not represent (a UDF, a set of values) |
 
@@ -143,6 +144,28 @@ cores x 24g:
 - spill is re-priced under the new memory grant.
 Less memory alone is predicted too fast: small executors keep little of the shuffle files in the
 page cache and read them back from disk, which is not priced (flag `LESS_MEMORY_LOWER_BOUND`).
+
+### A candidate that changes the plan
+
+When the candidate gives a query other joins or exchanges (`PLAN_SHAPE_CHANGED`), its stages have
+no recorded counterpart. They are built from the candidate's plan and priced by one rule: what the
+query's operators did apart from exchanging data is the same work under either plan, shared out
+by the bytes each new stage handles; what exchanging data costs (writing a shuffle, reading and
+sorting it) is taken out at the recorded amount and put back at the candidate's.
+
+What a shuffle write costs is the disk's rate, and a run that shuffles little does not show it
+(1.3 s per GB against 31 s per GB once the disk is busy). It is measured over the run and any
+other runs on the same hardware passed as `library`. A shuffle the run never wrote is sized from
+the rows it counted for that subplan, their schema's width and the compression of the query's
+other shuffles, spread evenly: a skewed key is not seen (`UNSEEN_SHUFFLE`).
+
+| Baseline | Candidate | Real wall-clock | Predicted |
+|---|---|---|---|
+| sort-merge joins, 395 s | broadcast threshold 10m | 191 s | 190 s |
+| broadcast joins, 191 s | broadcast off | 395 s | 439 s |
+
+One workload, and the two constants of the rule (CPU per shuffled byte, sort time per byte) were
+taken from this same pair of runs.
 
 ## Plans of TPC-DS
 

@@ -4,7 +4,7 @@ import java.io.File
 
 import scala.collection.mutable
 
-import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent, SparkListenerJobStart}
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution._
@@ -18,8 +18,9 @@ import org.apache.spark.sql.internal.SQLConf
  * configuration: every query is replayed under its recorded and under the candidate configuration,
  * and each stage whose shuffle read is cut differently gets the candidate's tasks.
  *
- * Only repartitioning is exported. A candidate that changes the shape of a plan (a join strategy,
- * an exchange) is refused: its stages have no recorded counterpart to take task costs from.
+ * A query whose plan the candidate changes (a join strategy, an exchange) has no recorded
+ * counterpart to take task costs from; its stages are built from the candidate's plan, see
+ * `replan`.
  */
 object WhatIfTrace {
   // A stage's total fetch wait grows with its task count to this power. The simulator's own
@@ -38,7 +39,7 @@ object WhatIfTrace {
   private val DefaultDiskPerSpilled = 0.25
   private val ReservedBytes = 300L << 20
 
-  private type Obj = Map[String, Any]
+  private[replay] type Obj = Map[String, Any]
 
   /**
    * How the recorded run spilled, measured on its own tasks so that it holds for this job on
@@ -77,7 +78,7 @@ object WhatIfTrace {
     }
   }
 
-  private def successful(stage: Obj): Seq[Obj] =
+  private[replay] def successful(stage: Obj): Seq[Obj] =
     stage("tasks").asInstanceOf[Seq[Obj]].filter(_("status") == "SUCCESS")
 
   /** The model on the executor shape of another configuration, at the rates measured here. */
@@ -134,10 +135,16 @@ object WhatIfTrace {
    */
   private case class Fragment(reads: Seq[String], sizes: Option[Seq[Long]])
 
-  private class Captured extends SparkListener {
+  private[replay] class Captured extends SparkListener {
     val plans = mutable.Buffer[SparkListenerSQLReplayPlan]()
     val shuffles = mutable.Buffer[SparkListenerSQLShuffleStageStats]()
     val sessionConf = mutable.Map[Long, Map[String, String]]()
+    /** Per execution, its jobs with their stages. */
+    val jobsOf = mutable.Map[Long, mutable.Buffer[(Int, Seq[Int])]]()
+    override def onJobStart(e: SparkListenerJobStart): Unit =
+      Option(e.properties).flatMap(p => Option(p.getProperty("spark.sql.execution.id"))).foreach { x =>
+        jobsOf.getOrElseUpdate(x.toLong, mutable.Buffer()) += ((e.jobId, e.stageIds))
+      }
     override def onOtherEvent(e: SparkListenerEvent): Unit = e match {
       case p: SparkListenerSQLReplayPlan => plans += p
       case s: SparkListenerSQLShuffleStageStats => shuffles += s
@@ -148,7 +155,7 @@ object WhatIfTrace {
 
   private def unsupported(what: String): Nothing = throw new ReplayUnsupportedException(what)
 
-  private def fake(s: ShuffleQueryStageExec): FakeShuffleExchangeExec = s.shuffle match {
+  private[replay] def fake(s: ShuffleQueryStageExec): FakeShuffleExchangeExec = s.shuffle match {
     case f: FakeShuffleExchangeExec => f
     case o => unsupported(s"not a replayed shuffle: ${o.nodeName}")
   }
@@ -167,7 +174,7 @@ object WhatIfTrace {
   }
 
   /** Bytes per partition of the stage this node runs in. */
-  private def sizes(p: SparkPlan): Option[Seq[Long]] = p match {
+  private[replay] def sizes(p: SparkPlan): Option[Seq[Long]] = p match {
     case AQEShuffleReadExec(s: ShuffleQueryStageExec, specs) =>
       Some(specs.map(specSize(fake(s), _)))
     case s: ShuffleQueryStageExec =>
@@ -214,7 +221,7 @@ object WhatIfTrace {
     case o => o.getClass.getSimpleName +: o.children.flatMap(shape)
   }
 
-  private def num(o: Obj, key: String): Double = o(key).asInstanceOf[Number].doubleValue
+  private[replay] def num(o: Obj, key: String): Double = o(key).asInstanceOf[Number].doubleValue
 
   // What a task held plus what it spilled is what it needed, per byte it read.
   private def memoryPerByte(tasks: Seq[Obj]): Double = {
@@ -303,14 +310,142 @@ object WhatIfTrace {
       .map(t => reshaped.getOrElse((t("index"), t("attempt")), t)))
   }
 
+  // CPU to serialize a byte into a shuffle and read it back, in ms. From two cluster runs of
+  // one workload with broadcast and with sort-merge joins: the difference of their CPU time over
+  // the bytes shuffled. ponytail: a constant; fit it per job once runs under both exist.
+  private val ShuffleCpuMsPerByte = 8e-6
+  // Sorting what a stage reads from a shuffle, in ms per byte: `sortTime` over the bytes read
+  // in the sort-merge run above.
+  private val SortMsPerByte = 1.1e-6
+
+  /**
+   * What shuffling costs on this hardware, which a run that shuffles little cannot tell: a disk
+   * shows its limit only when it is kept busy.
+   * @param writeBytesPerMs what the disks behind the executors take when stages write shuffle
+   * @param memoryPerByte working memory per byte a task reads from a shuffle
+   */
+  private case class ExchangeRates(writeBytesPerMs: Option[Double], memoryPerByte: Double)
+
+  /** Measured over the run and every other run given: the heavy ones dominate, as they should. */
+  private def exchangeRates(traces: Seq[Obj]): ExchangeRates = {
+    var bytesTimesTasks, writeMs = 0.0
+    val readers = mutable.Buffer[Obj]()
+    traces.foreach { trace =>
+      val slots = reshaped(SpillModel(0, 1, 1, 0, 0, None),
+        trace("config").asInstanceOf[Map[String, String]]).slots
+      trace("stages").asInstanceOf[Seq[Obj]].foreach { stage =>
+        val tasks = successful(stage)
+        bytesTimesTasks += tasks.map(num(_, "shuffle_write_bytes")).sum * math.min(tasks.length, slots)
+        writeMs += tasks.map(num(_, "shuffle_write_ms")).sum
+        readers ++= tasks.filter(num(_, "shuffle_read_bytes") > 0)
+      }
+    }
+    ExchangeRates(if (writeMs > 0 && bytesTimesTasks > 0) Some(bytesTimesTasks / writeMs) else None,
+      memoryPerByte(readers.toSeq))
+  }
+
+  /**
+   * The stages of a query whose plan the candidate changes: other joins, other exchanges. They
+   * have no recorded counterpart, so they are built from the candidate's plan and priced by one
+   * rule: what the query's operators did apart from exchanging data is the same work under either
+   * plan, and it is shared out by the bytes each new stage handles. What exchanging data costs
+   * (writing a shuffle, reading and sorting it) is taken out at the recorded amount and put back
+   * at the candidate's.
+   *
+   * @param recorded the stages the query really ran
+   * @return the stages of the candidate's plan; the last one is the result stage
+   */
+  private def replan(was: SparkPlan, becomes: SparkPlan, plan: SparkListenerSQLReplayPlan,
+      shuffles: Seq[SparkListenerSQLShuffleStageStats], recorded: Seq[Obj], model: SpillModel,
+      rates: ExchangeRates, firstStageId: Int): Seq[Obj] = {
+    val ran = recorded.flatMap(successful)
+    val sortMs = Option(plan.opNodes).map(_.indices.collect {
+      case i if plan.opNodes(i) == "Sort" && plan.opMetrics(i) == "sortTime" => plan.opValues(i).toDouble
+    }.sum).getOrElse(0.0)
+    val work = math.max(0.0, ran.map(num(_, "duration_ms")).sum - ran.map(num(_, "shuffle_write_ms")).sum -
+      sortMs - ShuffleCpuMsPerByte * ran.map(num(_, "shuffle_write_bytes")).sum)
+
+    // The recorded stage that scanned each leaf: its tasks say how a scan of it is cut.
+    val byId = recorded.map(s => s("stage_id") -> s).toMap[Any, Obj]
+    val scannedBy = StageFeatures.fragments(was).flatMap { f =>
+      val stage = f.output.collect { case e: FakeShuffleExchangeExec => e.recordedKey }
+        .flatMap(key => shuffles.find(_.key == key)).map(_.writerStageId).flatMap(byId.get(_))
+      val leaves = StageFeatures.local(f.root).filter(_.children.isEmpty).flatMap(Ctx.leafIndex)
+      stage.toSeq.flatMap(s => leaves.map(_ -> s))
+    }.toMap
+
+    case class Stage(scans: Seq[Obj], sizes: Option[Seq[Long]], written: Double, sorts: Boolean) {
+      val input: Double = scans.flatMap(successful).map(num(_, "input_bytes")).sum
+      val read: Double = sizes.map(_.sum.toDouble).getOrElse(0.0)
+      val shares: Seq[Double] = {
+        val weights = sizes.map(_.map(_.toDouble)).filter(_.nonEmpty)
+          .orElse(scans.headOption.map(successful(_).map(num(_, "input_bytes")))).filter(_.nonEmpty)
+          .getOrElse(Seq(1.0))
+        if (weights.sum > 0) weights.map(_ / weights.sum) else weights.map(_ => 1.0 / weights.length)
+      }
+    }
+    val fragments = StageFeatures.fragments(becomes)
+    val described = fragments.map { f =>
+      val nodes = StageFeatures.local(f.root)
+      Stage(nodes.filter(_.children.isEmpty).flatMap(Ctx.leafIndex).flatMap(scannedBy.get).distinct,
+        sizes(f.root),
+        f.output.collect { case e: FakeShuffleExchangeExec =>
+          Option(e.bytesByPartitionId).map(_.sum.toDouble).getOrElse(0.0) }.getOrElse(0.0),
+        nodes.exists(_.isInstanceOf[SortExec]))
+    }
+    val volume = described.map(d => d.input + d.read).sum
+    val template = ran.headOption.getOrElse(unsupported("a query without a task cannot be replanned"))
+
+    // Children come after their reader in `fragments`; a stage needs the ids of those it reads.
+    val stages = described.indices.map { i =>
+      val d = described(i)
+      val n = d.shares.length
+      val mine = work * (if (volume > 0) (d.input + d.read) / volume else 1.0 / described.length)
+      val writeWait = rates.writeBytesPerMs.map(d.written / _ * math.min(n, model.slots)).getOrElse(0.0)
+      val exchangeCpu = ShuffleCpuMsPerByte / 2 * (d.written + d.read) +
+        (if (d.sorts) SortMsPerByte * d.read else 0.0)
+      val reads = d.shares.map(_ * d.read)
+      val spills = expectedSpill(model, rates.memoryPerByte, reads)
+      val diskWait = model.diskWaitMs(spills)
+      val grants = model.grants(reads)
+      val like = d.scans.headOption.flatMap(successful(_).headOption).getOrElse(template)
+      val tasks = d.shares.indices.map { j =>
+        val w = d.shares(j)
+        val idle = writeWait * w + diskWait(j)
+        val duration = (mine + exchangeCpu) * w + spills(j) * model.cpuMsPerByte + idle
+        like ++ Map("index" -> j, "attempt" -> 0, "status" -> "SUCCESS", "speculative" -> false,
+          "error" -> None, "duration_ms" -> duration, "run_ms" -> duration,
+          "cpu_ms" -> (duration - idle), "deser_ms" -> 0, "gc_ms" -> 0, "sched_delay_ms" -> 0,
+          "input_bytes" -> d.input * w, "input_records" -> 0, "output_bytes" -> 0,
+          "output_records" -> 0, "shuffle_read_bytes" -> reads(j),
+          "shuffle_read_remote_bytes" -> reads(j), "shuffle_fetch_wait_ms" -> 0,
+          "shuffle_write_bytes" -> d.written * w, "shuffle_write_ms" -> writeWait * w,
+          "peak_exec_mem" -> math.min(rates.memoryPerByte * reads(j), grants(j)),
+          "spill_mem" -> spills(j), "spill_disk" -> spills(j) * model.diskPerSpilled)
+      }
+      Map[String, Any]("stage_id" -> (firstStageId + i), "attempt" -> 0, "status" -> "COMPLETE",
+        "name" -> "replanned", "submit_s" -> None, "complete_s" -> None, "num_tasks" -> n,
+        "num_failed_tasks" -> 0, "input_bytes" -> d.input, "output_bytes" -> 0,
+        "shuffle_read_bytes" -> d.read, "shuffle_write_bytes" -> d.written,
+        "spill_mem" -> spills.sum, "spill_disk" -> spills.sum * model.diskPerSpilled,
+        "failure_reason" -> None, "rdd_ids" -> Seq[Int](),
+        "parents_inferred" -> fragments.indices.filter(fragments(_).parent == i).map(firstStageId + _),
+        "tasks" -> tasks)
+    }
+    // Readers last, as a scheduler would complete them.
+    stages.reverse
+  }
+
   /**
    * @param spark a session with [[Replay.install]]; nothing is executed on it
    * @param conf the candidate configuration, on top of what each query ran with
+   * @param library event logs of other runs on the same hardware, of any job and configuration:
+   *        what shuffling costs there is measured over them and this run together
    * @param repeats event logs of other runs of the job at the recorded configuration; how much
    *        they differ from each other is how much a real run of the candidate may differ too
    */
   def build(spark: SparkSession, logPath: String, conf: Map[String, String],
-      repeats: Seq[String] = Nil): Map[String, Any] = {
+      repeats: Seq[String] = Nil, library: Seq[String] = Nil): Map[String, Any] = {
     val captured = new Captured
     val trace = AroTrace.build(logPath, listeners = Seq(captured))
     val recordedConf = trace("config").asInstanceOf[Map[String, String]]
@@ -331,7 +466,10 @@ object WhatIfTrace {
     val uncaptured = (captured.sessionConf.keySet -- captured.plans.map(_.executionId)).toSeq.sorted
     if (uncaptured.nonEmpty) flags += "UNCAPTURED_EXECUTION"
     val recuts = mutable.Buffer[Obj]()
+    val replans = mutable.Buffer[Obj]()
     val mismatched = mutable.Buffer[Long]()
+    val jobs = mutable.Buffer(trace("jobs").asInstanceOf[Seq[Obj]]: _*)
+    val rates = exchangeRates(trace +: library.map(AroTrace.build(_)))
     captured.plans.sortBy(_.executionId).foreach { plan =>
       val id = plan.executionId
       val shuffles = captured.shuffles.filter(_.executionId == id).toSeq
@@ -350,11 +488,28 @@ object WhatIfTrace {
       }
       val (becomes, raised) = replay(ranWith ++ conf)
       flags ++= raised
-      if (shape(was) != shape(becomes)) {
-        unsupported(s"execution $id: the plan changes shape under $conf; only a different " +
-          "partitioning of the same plan can be exported")
+      val replanned = shape(was) != shape(becomes)
+      if (replanned) {
+        flags += "PLAN_SHAPE_CHANGED"
+        val ran = captured.jobsOf.getOrElse(id, Nil)
+        val ids = ran.flatMap(_._2).toSet
+        val old = stages.keys.filter(k => ids(k._1.asInstanceOf[Int])).toSeq
+        val next = (stages.keys.map(_._1.asInstanceOf[Int]) ++ ids).max + 1
+        val built = replan(was, becomes, plan, shuffles, old.map(stages), model, rates, next)
+        old.foreach(stages.remove)
+        built.foreach(s => stages((s("stage_id"), s("attempt"))) = s)
+        recutKeys ++= built.map(s => (s("stage_id"), s("attempt")))
+        // One job in place of the query's: same place in the driver's order, the new stages.
+        val mine = jobs.filter(j => ran.exists(_._1 == j("job_id")))
+        jobs --= mine
+        jobs += Map("job_id" -> mine.map(_("job_id").asInstanceOf[Int]).min,
+          "name" -> s"replanned execution $id", "status" -> "SUCCEEDED",
+          "stage_ids" -> built.map(_("stage_id")),
+          "submit_s" -> Some(mine.flatMap(_("submit_s").asInstanceOf[Option[Double]]).min),
+          "complete_s" -> Some(mine.flatMap(_("complete_s").asInstanceOf[Option[Double]]).max))
+        replans += Map("execution" -> id, "stages_before" -> old.size, "stages_after" -> built.size)
       }
-      fragments(was).zip(fragments(becomes)).foreach {
+      if (!replanned) fragments(was).zip(fragments(becomes)).foreach {
         case (old, cut) if old.sizes.isDefined && old.sizes != cut.sizes =>
           val writers = old.reads.map { key =>
             shuffles.find(_.key == key).map(_.writerStageId).filter(_ >= 0)
@@ -390,16 +545,19 @@ object WhatIfTrace {
       }
     }
     trace ++ Map(
+      "jobs" -> jobs.sortBy(_("job_id").asInstanceOf[Int]).toSeq,
       "stages" -> stages.values.toSeq,
       "config" -> (recordedConf ++ conf),
       "what_if" -> Map("conf" -> conf, "flags" -> flags.toSeq, "recut_stages" -> recuts.toSeq,
+        "replanned" -> replans.toSeq,
+        "shuffle_write_mb_per_s" -> rates.writeBytesPerMs.map(_ / 1e3),
         // What the engine could not reproduce of the run itself: no prediction built on those
         // queries deserves trust, whatever the candidate.
         "calibration" -> Map("executions" -> captured.sessionConf.size,
           "reproduced" -> (captured.plans.size - mismatched.size),
           "mismatched" -> mismatched.toSeq, "uncaptured" -> uncaptured,
           "ok" -> (mismatched.isEmpty && uncaptured.isEmpty)),
-        "band" -> band(trace, repeats, recuts.nonEmpty, model != recordedModel),
+        "band" -> band(trace, repeats, recuts.nonEmpty, model != recordedModel, replans.nonEmpty),
         "spill_model" -> Map("cpu_s_per_gb" -> model.cpuMsPerByte * 1e6,
           "disk_per_spilled" -> model.diskPerSpilled,
           "disk_mb_per_s" -> model.diskBytesPerMs.map(_ / 1e3))))
@@ -410,15 +568,19 @@ object WhatIfTrace {
   // A candidate that only cuts memory is excluded; it is flagged as a lower bound instead.
   private val ConfigErrorPct = 16.0
   private val ShapeErrorPct = 17.0
+  // A changed plan is priced by rule, not from its own recorded tasks.
+  private val ReplanErrorPct = 25.0
 
   /**
    * How far a real run of the candidate may be from the prediction, in percent of wall-clock:
    * the run-to-run spread of the job itself, unknown without repeats, and the model's own error.
    */
-  private def band(trace: Obj, repeats: Seq[String], recut: Boolean, reshaped: Boolean): Obj = {
+  private def band(trace: Obj, repeats: Seq[String], recut: Boolean, reshaped: Boolean,
+      replanned: Boolean): Obj = {
     val walls = (trace +: repeats.map(AroTrace.build(_))).map(AroTrace.wallClockSeconds)
     val noise = if (repeats.isEmpty) None else Some((walls.max - walls.min) / walls.min * 100)
-    val model = math.max(if (recut) ConfigErrorPct else 0.0, if (reshaped) ShapeErrorPct else 0.0)
+    val model = Seq(if (recut) ConfigErrorPct else 0.0, if (reshaped) ShapeErrorPct else 0.0,
+      if (replanned) ReplanErrorPct else 0.0).max
     Map("noise_pct" -> noise, "model_pct" -> model,
       "total_pct" -> noise.map(n => math.sqrt(n * n + model * model)))
   }

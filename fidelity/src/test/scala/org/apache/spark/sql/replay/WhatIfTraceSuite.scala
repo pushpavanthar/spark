@@ -75,12 +75,31 @@ class WhatIfTraceSuite extends AnyFunSuite {
     } finally spark.stop()
   }
 
-  test("a candidate that changes a join strategy is refused") {
+  test("a candidate that changes a join strategy gets the stages of its own plan") {
+    val conf = Map("spark.sql.autoBroadcastJoinThreshold" -> "-1")
+    val real = AroTrace.build(Harness.runWithEventLog(4, "measure", capture, conf))
+    // Before the engine's session exists: a run would otherwise reuse it, without an event log.
+    val log = baseline
     val spark = Harness.session()
-    val e = try intercept[ReplayUnsupportedException] {
-      WhatIfTrace.build(spark, baseline, Map("spark.sql.autoBroadcastJoinThreshold" -> "-1"))
-    } finally spark.stop()
-    assert(e.getMessage.contains("changes shape"))
+    val whatIf = try WhatIfTrace.build(spark, log, conf) finally spark.stop()
+    val w = whatIf("what_if").asInstanceOf[Obj]
+    assert(w("flags").asInstanceOf[Seq[String]].contains("PLAN_SHAPE_CHANGED"))
+    assert(w("replanned").asInstanceOf[Seq[Obj]].nonEmpty)
+    AroTrace.write(whatIf, new File("target/aro-traces/whatif-broadcast-off"))
+    AroTrace.write(real, new File("target/aro-traces/real-broadcast-off"))
+    // Every stage a job lists exists, and every parent of a stage too: the trace can be replayed.
+    val ids = stages(whatIf).map(_("stage_id")).toSet
+    whatIf("jobs").asInstanceOf[Seq[Obj]].filter(_("name").toString.startsWith("replanned"))
+      .foreach(j => assert(j("stage_ids").asInstanceOf[Seq[Any]].forall(ids)))
+    stages(whatIf).filter(_("name") == "replanned").foreach { s =>
+      assert(s("parents_inferred").asInstanceOf[Seq[Any]].forall(ids))
+      assert(s("tasks").asInstanceOf[Seq[Obj]].forall(
+        _("duration_ms").asInstanceOf[Number].doubleValue >= 0))
+    }
+    // Without broadcasts every join shuffles both sides: more stages and more tasks than before.
+    assert(taskCounts(whatIf).sum > taskCounts(AroTrace.build(baseline)).sum)
+    info(s"tasks what-if ${taskCounts(whatIf).sum}, real ${taskCounts(real).sum}; task time " +
+      f"what-if ${taskSeconds(whatIf)}%.1f s, real ${taskSeconds(real)}%.1f s")
   }
 
   test("a coalesce is replayed with the recorded default parallelism, not the engine's") {
